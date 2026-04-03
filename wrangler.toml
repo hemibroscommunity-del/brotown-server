@@ -23,22 +23,7 @@ class_name = "Arena"
 name = "FEEDBACK"
 class_name = "Feedback"
 
-# Migration for first deploy
+# Migration — SQLite-backed Durable Objects (required for free plan)
 [[migrations]]
 tag = "v1"
-new_classes = ["GameRoom"]
-
-# Migration for marketplace + leaderboard
-[[migrations]]
-tag = "v2"
-new_classes = ["Marketplace", "Leaderboard"]
-
-# Migration for arena
-[[migrations]]
-tag = "v3"
-new_classes = ["Arena"]
-
-# Migration for feedback
-[[migrations]]
-tag = "v4"
-new_classes = ["Feedback"]
+new_sqlite_classes = ["GameRoom", "Marketplace", "Leaderboard", "Arena", "Feedback"]
