@@ -61,13 +61,13 @@ export class GameRoom {
     this.eventBuffer = [];
     this.tickInterval = null;
     this.tickSeq = 0;
-    this.TICK_RATE = 33; // 30Hz (33ms)
+    this.TICK_RATE = 22; // 45Hz (22ms)
     this.MAX_PLAYERS = 50;
     this.EVENTS_PER_TICK_CAP = 500;
 
     // §16.12 — PvP Lag Compensation
     this.stateHistory = {};
-    this.LAGCOMP_BUFFER_TICKS = 9;
+    this.LAGCOMP_BUFFER_TICKS = 14; // 300ms of history at 45Hz
     this.LAGCOMP_RTT_CAP = 300;
     this.LAGCOMP_RTT_ALPHA = 0.3;
 
