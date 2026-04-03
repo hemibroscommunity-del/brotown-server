@@ -336,7 +336,7 @@ export class GameRoom {
           element: m.element,
           x: m.x,
           y: m.y,
-          recipients: playersInZone, // all players who get XP/gold
+          recipients: [session.id], // only the killer gets XP/gold (party sharing TBD)
         }
       });
     }
