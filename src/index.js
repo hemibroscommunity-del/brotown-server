@@ -58,18 +58,288 @@ export class GameRoom {
     this.sessions = new Map();
     this.playerState = {};
     this.dirtyPlayers = new Set();
-    this.eventBuffer = []; // §16.10 — batched events sent with tick
+    this.eventBuffer = [];
     this.tickInterval = null;
     this.tickSeq = 0;
     this.TICK_RATE = 33; // 30Hz (33ms)
     this.MAX_PLAYERS = 50;
-    this.EVENTS_PER_TICK_CAP = 500; // §16.10
+    this.EVENTS_PER_TICK_CAP = 500;
 
     // §16.12 — PvP Lag Compensation
-    this.stateHistory = {}; // playerId -> [StateSnapshot, ...] (ring buffer)
-    this.LAGCOMP_BUFFER_TICKS = 9; // 300ms of history at 30Hz
-    this.LAGCOMP_RTT_CAP = 300; // ms
-    this.LAGCOMP_RTT_ALPHA = 0.3; // EMA smoothing
+    this.stateHistory = {};
+    this.LAGCOMP_BUFFER_TICKS = 9;
+    this.LAGCOMP_RTT_CAP = 300;
+    this.LAGCOMP_RTT_ALPHA = 0.3;
+
+    // Server-authoritative monsters
+    this.monsters = {}; // zoneId -> [monster, ...]
+    this.dirtyMonsters = new Set(); // zoneIds with changed monsters
+    this.RESPAWN_TIME = 15000; // 15s respawn
+    this.MONSTER_AGGRO_RANGE = 120; // pixels
+    this.MONSTER_ATTACK_RANGE = 25;
+    this.MONSTER_ATTACK_CD = 1500; // ms
+    this.TILE = 32;
+  }
+
+  // Monster stat scaling (mirrors client-side monsterStat)
+  _monsterStat(base, level, r1, r2, r3) {
+    let v = base;
+    for (let i = 1; i < level; i++) {
+      if (i < 30) v *= r1;
+      else if (i < 65) v *= r2;
+      else v *= r3;
+    }
+    return Math.ceil(v);
+  }
+
+  // Archetype definitions (mirrors client ARCHETYPES)
+  _getArchetype(arch) {
+    const ARCHETYPES = {
+      fodder:   { hpMult: 0.6, dmgMult: 0.8, spdMult: 1.0, emoji: '🟢', color: '#3dd497' },
+      brute:    { hpMult: 1.5, dmgMult: 1.3, spdMult: 0.7, emoji: '🪨', color: '#6b6b6b' },
+      swarm:    { hpMult: 0.4, dmgMult: 0.6, spdMult: 1.2, emoji: '🦇', color: '#9333ea' },
+      sentinel: { hpMult: 1.0, dmgMult: 1.0, spdMult: 1.0, emoji: '🛡️', color: '#e8e8e8' },
+      volatile: { hpMult: 0.8, dmgMult: 1.0, spdMult: 1.0, emoji: '💥', color: '#ea580c' },
+      stalker:  { hpMult: 0.7, dmgMult: 1.2, spdMult: 1.3, emoji: '👁️', color: '#2C3E50' },
+      hexer:    { hpMult: 0.9, dmgMult: 0.8, spdMult: 1.0, emoji: '💀', color: '#8E44AD' },
+    };
+    return ARCHETYPES[arch] || ARCHETYPES.fodder;
+  }
+
+  // Zone spawn definitions (mirrors client ZONES.spawns)
+  _getZoneConfig(zoneId) {
+    const ZONES = {
+      meadow:  { w:50, h:40, level:[1,10],  element:null,    spawns:[{arch:'fodder',count:10},{arch:'swarm',count:4}] },
+      ember:   { w:50, h:40, level:[1,10],  element:'flame', spawns:[{arch:'fodder',count:8},{arch:'brute',count:3},{arch:'volatile',count:2}] },
+      mist:    { w:50, h:40, level:[5,15],  element:'venom', spawns:[{arch:'fodder',count:6},{arch:'swarm',count:5},{arch:'hexer',count:2}] },
+      frost:   { w:50, h:40, level:[8,18],  element:'frost', spawns:[{arch:'fodder',count:7},{arch:'brute',count:3},{arch:'sentinel',count:2}] },
+      thunder: { w:50, h:40, level:[12,22], element:'storm', spawns:[{arch:'fodder',count:6},{arch:'volatile',count:3},{arch:'stalker',count:2}] },
+      hollows: { w:50, h:40, level:[18,28], element:'stone', spawns:[{arch:'brute',count:4},{arch:'sentinel',count:3},{arch:'stalker',count:2}] },
+      sky:     { w:50, h:40, level:[22,32], element:'wind',  spawns:[{arch:'swarm',count:6},{arch:'fodder',count:5},{arch:'volatile',count:2}] },
+      tidal:   { w:50, h:40, level:[15,25], element:'water', spawns:[{arch:'fodder',count:7},{arch:'swarm',count:4},{arch:'hexer',count:2}] },
+    };
+    return ZONES[zoneId] || null;
+  }
+
+  // Spawn monsters for a zone
+  _spawnZoneMonsters(zoneId) {
+    const zone = this._getZoneConfig(zoneId);
+    if (!zone || !zone.spawns) return [];
+    const W = zone.w * this.TILE;
+    const H = zone.h * this.TILE;
+    const margin = 4 * this.TILE;
+    const monsters = [];
+    let idx = 0;
+    for (const spawn of zone.spawns) {
+      for (let i = 0; i < spawn.count; i++) {
+        const x = margin + Math.random() * (W - margin * 2);
+        const y = margin + Math.random() * (H - margin * 2);
+        const depthPct = Math.max(0, Math.min(1, y / H));
+        const baseLvl = zone.level[0] || 1;
+        const maxLvl = zone.level[1] || 10;
+        const lvl = Math.max(1, Math.round(baseLvl + depthPct * (maxLvl - baseLvl)));
+        const a = this._getArchetype(spawn.arch);
+        const baseHp = this._monsterStat(60, lvl, 1.065, 1.035, 1.025);
+        const baseDmg = this._monsterStat(12, lvl, 1.045, 1.025, 1.018);
+        const baseXp = this._monsterStat(10, lvl, 1.045, 1.025, 1.018);
+        const baseGold = this._monsterStat(5, lvl, 1.035, 1.020, 1.015);
+        monsters.push({
+          id: 'sm-' + zoneId + '-' + idx,
+          arch: spawn.arch,
+          level: lvl,
+          element: zone.element || null,
+          hp: Math.ceil(baseHp * a.hpMult),
+          maxHp: Math.ceil(baseHp * a.hpMult),
+          dmg: Math.ceil(baseDmg * a.dmgMult),
+          xp: Math.ceil(baseXp),
+          gold: Math.ceil(baseGold),
+          spd: 0.5 * a.spdMult,
+          emoji: a.emoji,
+          color: a.color,
+          x, y, spawnX: x, spawnY: y,
+          alive: true,
+          targetId: null, // player being chased
+          atkCd: 0,
+          respawnAt: 0,
+        });
+        idx++;
+      }
+    }
+    return monsters;
+  }
+
+  // Ensure monsters exist for a zone (lazy spawn)
+  _ensureZoneMonsters(zoneId) {
+    if (!this.monsters[zoneId]) {
+      this.monsters[zoneId] = this._spawnZoneMonsters(zoneId);
+      if (this.monsters[zoneId].length > 0) this.dirtyMonsters.add(zoneId);
+    }
+    return this.monsters[zoneId];
+  }
+
+  // Get zones that have players in them
+  _activeZones() {
+    const zones = new Set();
+    for (const ps of Object.values(this.playerState)) {
+      if (ps.z && ps.z !== 'town' && ps.z !== 'farm_home') zones.add(ps.z);
+    }
+    return zones;
+  }
+
+  // Tick monster AI and respawns
+  _tickMonsters() {
+    const now = Date.now();
+    const activeZones = this._activeZones();
+
+    for (const zoneId of activeZones) {
+      const monsters = this._ensureZoneMonsters(zoneId);
+      if (!monsters || monsters.length === 0) continue;
+
+      // Get players in this zone
+      const playersInZone = [];
+      for (const [id, ps] of Object.entries(this.playerState)) {
+        if (ps.z === zoneId && !ps.dead && !ps.disconnected) {
+          playersInZone.push({ id, ...ps });
+        }
+      }
+
+      let zoneChanged = false;
+
+      for (const m of monsters) {
+        // Respawn check
+        if (!m.alive) {
+          if (m.respawnAt > 0 && now >= m.respawnAt) {
+            m.alive = true;
+            m.hp = m.maxHp;
+            m.x = m.spawnX;
+            m.y = m.spawnY;
+            m.targetId = null;
+            m.atkCd = 0;
+            zoneChanged = true;
+          }
+          continue;
+        }
+
+        // Find nearest player for aggro
+        let nearest = null;
+        let nearestDist = Infinity;
+        for (const p of playersInZone) {
+          const dx = p.x - m.x;
+          const dy = p.y - m.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < nearestDist) {
+            nearest = p;
+            nearestDist = dist;
+          }
+        }
+
+        // Movement AI
+        if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
+          m.targetId = nearest.id;
+          // Move toward player
+          if (nearestDist > this.MONSTER_ATTACK_RANGE) {
+            const dx = nearest.x - m.x;
+            const dy = nearest.y - m.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 0) {
+              m.x += (dx / dist) * m.spd;
+              m.y += (dy / dist) * m.spd;
+              zoneChanged = true;
+            }
+          }
+
+          // Attack player if in range
+          if (nearestDist <= this.MONSTER_ATTACK_RANGE && now > m.atkCd) {
+            m.atkCd = now + this.MONSTER_ATTACK_CD;
+            // Push monster_attack event
+            this.eventBuffer.push({
+              type: 'monster_attack',
+              payload: {
+                monsterId: m.id,
+                targetId: nearest.id,
+                dmg: m.dmg,
+                zone: zoneId,
+              }
+            });
+          }
+        } else {
+          // Idle wander — slow random movement back toward spawn
+          m.targetId = null;
+          const dxSpawn = m.spawnX - m.x;
+          const dySpawn = m.spawnY - m.y;
+          const distSpawn = Math.sqrt(dxSpawn * dxSpawn + dySpawn * dySpawn);
+          if (distSpawn > 30) {
+            m.x += (dxSpawn / distSpawn) * m.spd * 0.3;
+            m.y += (dySpawn / distSpawn) * m.spd * 0.3;
+            zoneChanged = true;
+          }
+        }
+      }
+
+      if (zoneChanged) this.dirtyMonsters.add(zoneId);
+    }
+  }
+
+  // Process player damage to a monster
+  _handleMonsterDamage(session, payload) {
+    const { monsterId, zone, dmg, isCrit, element } = payload;
+    if (!monsterId || !zone || !dmg) return;
+    const monsters = this.monsters[zone];
+    if (!monsters) return;
+    const m = monsters.find(x => x.id === monsterId);
+    if (!m || !m.alive) return;
+
+    // Apply damage
+    const actualDmg = Math.max(1, Math.round(dmg));
+    m.hp -= actualDmg;
+    this.dirtyMonsters.add(zone);
+
+    // Push damage event for all clients to see
+    this.eventBuffer.push({
+      type: 'monster_hit',
+      payload: {
+        monsterId: m.id,
+        zone,
+        dmg: actualDmg,
+        isCrit: !!isCrit,
+        attackerId: session.id,
+        hpPct: Math.max(0, m.hp / m.maxHp),
+      }
+    });
+
+    // Kill check
+    if (m.hp <= 0) {
+      m.alive = false;
+      m.respawnAt = Date.now() + this.RESPAWN_TIME;
+
+      // Distribute XP and gold to all contributors in range
+      const playersInZone = [];
+      for (const [id, ps] of Object.entries(this.playerState)) {
+        if (ps.z === zone && !ps.dead && !ps.disconnected) {
+          const dx = ps.x - m.x;
+          const dy = ps.y - m.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < 300) playersInZone.push(id); // within contribution range
+        }
+      }
+
+      this.eventBuffer.push({
+        type: 'monster_kill',
+        payload: {
+          monsterId: m.id,
+          zone,
+          killerId: session.id,
+          xp: m.xp,
+          gold: m.gold,
+          level: m.level,
+          arch: m.arch,
+          element: m.element,
+          x: m.x,
+          y: m.y,
+          recipients: playersInZone, // all players who get XP/gold
+        }
+      });
+    }
   }
 
   async fetch(request) {
@@ -104,7 +374,21 @@ export class GameRoom {
         };
         this.stateHistory[msg.id] = [];
         this.broadcastExcept(ws, { type: 'player_join', id: msg.id, name: msg.name, data: msg.data });
-        ws.send(JSON.stringify({ type: 'state_sync', players: this.getAllPlayerData(), playerCount: this.getPlayerCount() }));
+        // Send current state + monsters for player's zone
+        const joinZone = msg.data?.z || 'town';
+        const zoneMonsters = (joinZone !== 'town' && joinZone !== 'farm_home') ? this._ensureZoneMonsters(joinZone) : [];
+        ws.send(JSON.stringify({
+          type: 'state_sync',
+          players: this.getAllPlayerData(),
+          playerCount: this.getPlayerCount(),
+          monsters: zoneMonsters.map(m => ({
+            id: m.id, arch: m.arch, level: m.level, element: m.element,
+            x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp, dmg: m.dmg,
+            xp: m.xp, gold: m.gold, spd: m.spd, emoji: m.emoji, color: m.color,
+            alive: m.alive,
+          })),
+          monsterZone: joinZone,
+        }));
         this.broadcastAll({ type: 'player_count', count: this.getPlayerCount() });
         this.reportToLeaderboard(session);
         break;
@@ -112,18 +396,32 @@ export class GameRoom {
       case 'move':
         if (session.id && this.playerState[session.id]) {
           const ps = this.playerState[session.id];
+          const oldZone = ps.z;
           ps.x = msg.x; ps.y = msg.y; ps.d = msg.d || ps.d; ps.z = msg.z || ps.z;
           ps.vx = msg.vx || 0; ps.vy = msg.vy || 0;
-          // §16.12 — Combat state flags from client
           if (msg.dodging !== undefined) ps.dodging = !!msg.dodging;
           if (msg.blocking !== undefined) ps.blocking = !!msg.blocking;
           if (msg.dead !== undefined) ps.dead = !!msg.dead;
           this.dirtyPlayers.add(session.id);
+
+          // Zone change — send monster state for new zone
+          if (ps.z !== oldZone && ps.z !== 'town' && ps.z !== 'farm_home') {
+            const newMonsters = this._ensureZoneMonsters(ps.z);
+            ws.send(JSON.stringify({
+              type: 'zone_monsters',
+              zone: ps.z,
+              monsters: newMonsters.map(m => ({
+                id: m.id, arch: m.arch, level: m.level, element: m.element,
+                x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp, dmg: m.dmg,
+                xp: m.xp, gold: m.gold, spd: m.spd, emoji: m.emoji, color: m.color,
+                alive: m.alive,
+              })),
+            }));
+          }
         }
         break;
 
       case 'pong':
-        // §16.12 — RTT estimation from ping/pong
         if (session.lastPing > 0) {
           const sample = Date.now() - session.lastPing;
           session.rtt = session.rtt * (1 - this.LAGCOMP_RTT_ALPHA) + sample * this.LAGCOMP_RTT_ALPHA;
@@ -141,14 +439,19 @@ export class GameRoom {
         break;
 
       case 'player_attack':
-        // §16.12 — Server-side PvP hit detection with lag compensation
         if (session.id) {
           this._resolvePvPAttack(session, msg.payload || msg);
         }
         break;
 
+      case 'monster_damage':
+        // Client reports damage dealt to a server monster
+        if (session.id) {
+          this._handleMonsterDamage(session, msg.payload || msg);
+        }
+        break;
+
       default:
-        // §16.10 — Buffer game events for next tick broadcast
         if (session.id) {
           msg.from = session.id;
           this.eventBuffer.push(msg);
@@ -245,11 +548,10 @@ export class GameRoom {
   async webSocketError(ws) { this.webSocketClose(ws); }
 
   startTickLoop() {
-    // §16.12 — Ping counter for RTT measurement
     let pingCounter = 0;
 
     this.tickInterval = setInterval(() => {
-      // §16.12 — Step 1: Snapshot player states to history buffer
+      // §16.12 — Snapshot player states to history buffer
       for (const [id, ps] of Object.entries(this.playerState)) {
         if (!this.stateHistory[id]) this.stateHistory[id] = [];
         this.stateHistory[id].push({
@@ -259,15 +561,17 @@ export class GameRoom {
           dead: ps.dead || false,
           tick: this.tickSeq,
         });
-        // Ring buffer — keep only LAGCOMP_BUFFER_TICKS entries
         if (this.stateHistory[id].length > this.LAGCOMP_BUFFER_TICKS) {
           this.stateHistory[id].shift();
         }
       }
 
-      // §16.12 — Periodic ping for RTT estimation (every 5s = 100 ticks)
+      // Monster AI tick
+      this._tickMonsters();
+
+      // Periodic ping for RTT estimation (every ~3s at 30Hz)
       pingCounter++;
-      if (pingCounter >= 100) {
+      if (pingCounter >= 90) {
         pingCounter = 0;
         const pingMsg = JSON.stringify({ type: 'ping', ts: Date.now() });
         for (const [ws, session] of this.sessions) {
@@ -278,12 +582,13 @@ export class GameRoom {
 
       const hasDirty = this.dirtyPlayers.size > 0;
       const hasEvents = this.eventBuffer.length > 0;
-      if (!hasDirty && !hasEvents) { this.tickSeq++; return; }
+      const hasMonsters = this.dirtyMonsters.size > 0;
+      if (!hasDirty && !hasEvents && !hasMonsters) { this.tickSeq++; return; }
 
-      // §16.8 — Build single room-wide tick delta
+      // Build single room-wide tick delta
       const delta = { type: 'tick', seq: this.tickSeq++, ts: Date.now() };
 
-      // §16.9 — Batched player positions (only dirty)
+      // Batched player positions (only dirty)
       if (hasDirty) {
         const players = {};
         for (const id of this.dirtyPlayers) {
@@ -294,7 +599,7 @@ export class GameRoom {
         this.dirtyPlayers.clear();
       }
 
-      // §16.10 — Batched game events (capped)
+      // Batched game events (capped)
       if (hasEvents) {
         delta.events = this.eventBuffer.length <= this.EVENTS_PER_TICK_CAP
           ? this.eventBuffer
@@ -302,7 +607,21 @@ export class GameRoom {
         this.eventBuffer = [];
       }
 
-      // §16.8 — Single broadcast to all clients
+      // Monster state updates (only dirty zones, only alive + recently died)
+      if (hasMonsters) {
+        const mData = {};
+        for (const zoneId of this.dirtyMonsters) {
+          const monsters = this.monsters[zoneId];
+          if (!monsters) continue;
+          mData[zoneId] = monsters.map(m => ({
+            id: m.id, x: Math.round(m.x), y: Math.round(m.y),
+            hp: m.hp, alive: m.alive,
+          }));
+        }
+        delta.monsters = mData;
+        this.dirtyMonsters.clear();
+      }
+
       const msg = JSON.stringify(delta);
       for (const [ws] of this.sessions) { try { ws.send(msg); } catch {} }
     }, this.TICK_RATE);
