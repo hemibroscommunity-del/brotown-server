@@ -79,6 +79,19 @@ export class GameRoom {
     this.MONSTER_ATTACK_RANGE = 25;
     this.MONSTER_ATTACK_CD = 1500; // ms
     this.TILE = 32;
+
+    // Idle timeout — drop sessions that haven't sent any message in this long.
+    // Client pongs ~every 3s, so 45s means ~15 missed pongs before eviction.
+    this.IDLE_TIMEOUT_MS = 45000;
+
+    // On DO wake, close any hibernated sockets we don't have a session for.
+    // These are orphans from prior wakes (crashed tabs, expired clients, etc.)
+    // and would otherwise leak forever since webSocketClose only fires on TCP close.
+    try {
+      for (const ws of this.state.getWebSockets()) {
+        try { ws.close(1000, 'stale on wake'); } catch {}
+      }
+    } catch {}
   }
 
   // Monster stat scaling (mirrors client-side monsterStat)
@@ -351,7 +364,7 @@ export class GameRoom {
     }
     const [client, server] = Object.values(new WebSocketPair());
     this.state.acceptWebSocket(server);
-    this.sessions.set(server, { id: null, name: 'Anon', data: {}, rtt: 80, lastPing: 0 });
+    this.sessions.set(server, { id: null, name: 'Anon', data: {}, rtt: 80, lastPing: 0, lastRecv: Date.now() });
     if (!this.tickInterval && this.sessions.size === 1) this.startTickLoop();
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -359,6 +372,7 @@ export class GameRoom {
   async webSocketMessage(ws, message) {
     const session = this.sessions.get(ws);
     if (!session) return;
+    session.lastRecv = Date.now();
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
 
@@ -569,13 +583,18 @@ export class GameRoom {
       // Monster AI tick
       this._tickMonsters();
 
-      // Periodic ping for RTT estimation (every ~3s at 30Hz)
+      // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
       if (pingCounter >= 90) {
         pingCounter = 0;
-        const pingMsg = JSON.stringify({ type: 'ping', ts: Date.now() });
+        const nowMs = Date.now();
+        const pingMsg = JSON.stringify({ type: 'ping', ts: nowMs });
         for (const [ws, session] of this.sessions) {
-          session.lastPing = Date.now();
+          if (nowMs - session.lastRecv > this.IDLE_TIMEOUT_MS) {
+            try { ws.close(1000, 'idle timeout'); } catch {}
+            continue;
+          }
+          session.lastPing = nowMs;
           try { ws.send(pingMsg); } catch {}
         }
       }
