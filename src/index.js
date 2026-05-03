@@ -291,6 +291,13 @@ export class GameRoom {
                 attackerY: m.y,
               }
             });
+            // Mark zone dirty so the monster's position is included in the
+            // outgoing tick delta. Without this, a stationary monster that
+            // attacks a stationary player produces attack events but no
+            // position broadcast, so any client that missed the initial sync
+            // never registers the monster locally — leading to "ghost hit"
+            // damage reports with no visible attacker.
+            zoneChanged = true;
           }
         } else {
           // Idle wander — slow random movement back toward spawn
