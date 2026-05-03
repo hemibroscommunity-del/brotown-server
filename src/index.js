@@ -263,8 +263,23 @@ export class GameRoom {
 
           // Attack player if in range
           if (nearestDist <= this.MONSTER_ATTACK_RANGE && now > m.atkCd) {
+            // Don't fire damage events while the player is blocking — the
+            // client's monster_attack handler also computes block reduction,
+            // but that path was producing inconsistent block resolution
+            // (client snapshot of monster position can drift from server,
+            // making the directional arc test miss). Skipping the event
+            // entirely when the player has shield up gives reliable
+            // blocking. We still set atkCd so the monster doesn't keep
+            // queuing while the player blocks.
+            if (nearest.blocking) {
+              m.atkCd = now + this.MONSTER_ATTACK_CD;
+              continue;
+            }
             m.atkCd = now + this.MONSTER_ATTACK_CD;
-            // Push monster_attack event
+            // Push monster_attack event. Include the monster's authoritative
+            // x/y so the client's arc check + out-of-range filter resolve
+            // against the server's view of the world rather than the local
+            // snapshot (which can lag a few ticks).
             this.eventBuffer.push({
               type: 'monster_attack',
               payload: {
@@ -272,6 +287,8 @@ export class GameRoom {
                 targetId: nearest.id,
                 dmg: m.dmg,
                 zone: zoneId,
+                attackerX: m.x,
+                attackerY: m.y,
               }
             });
           }
