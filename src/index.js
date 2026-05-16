@@ -326,9 +326,19 @@ export class GameRoom {
     const m = monsters.find(x => x.id === monsterId);
     if (!m || !m.alive) return;
 
-    // Apply damage
-    const actualDmg = Math.max(1, Math.round(dmg));
-    m.hp -= actualDmg;
+    // Apply damage. Clamp the credited amount to the monster's remaining
+    // HP so the overkill on the final blow doesn't inflate the killer's
+    // contribution share (GDD §7: DPS = damage / monster_max_hp).
+    const rawDmg = Math.max(1, Math.round(dmg));
+    const actualDmg = Math.min(rawDmg, Math.max(0, m.hp));
+    m.hp -= rawDmg;
+
+    // Track per-player damage contribution for the kill-time share.
+    // dmgByPlayer is created lazily so existing monster snapshots
+    // without it stay compatible.
+    if (!m.dmgByPlayer) m.dmgByPlayer = {};
+    m.dmgByPlayer[session.id] = (m.dmgByPlayer[session.id] || 0) + actualDmg;
+
     this.dirtyMonsters.add(zone);
 
     // Push damage event for all clients to see
@@ -349,15 +359,30 @@ export class GameRoom {
       m.alive = false;
       m.respawnAt = Date.now() + this.RESPAWN_TIME;
 
-      // Distribute XP and gold to all contributors in range
-      const playersInZone = [];
-      for (const [id, ps] of Object.entries(this.playerState)) {
-        if (ps.z === zone && !ps.dead && !ps.disconnected) {
-          const dx = ps.x - m.x;
-          const dy = ps.y - m.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < 300) playersInZone.push(id); // within contribution range
-        }
+      // GDD §7 — contribution-weighted XP/gold distribution.
+      // DPS share = dmgByPlayer[id] / m.maxHp.  We also require the
+      // recipient to be alive, connected, and still in the kill zone
+      // (anyone who tagged the monster then walked away or died forfeits).
+      const contributions = m.dmgByPlayer || {};
+      const totalShareDenom = Object.values(contributions).reduce((a, b) => a + b, 0) || 1;
+      const xpRecipients = [];
+      const goldRecipients = [];
+      const shares = {};
+      for (const [pid, contributed] of Object.entries(contributions)) {
+        const ps = this.playerState[pid];
+        if (!ps || ps.dead || ps.disconnected || ps.z !== zone) continue;
+        const share = contributed / totalShareDenom;
+        shares[pid] = share;
+        xpRecipients.push(pid);
+        // GDD §7: gold cutoff at 0.05 contribution; below → no gold
+        if (share >= 0.05) goldRecipients.push(pid);
+      }
+      // Fallback: if every contributor dropped out (dead/left zone),
+      // fall back to last-hit credit so the loot doesn't vanish.
+      if (xpRecipients.length === 0) {
+        xpRecipients.push(session.id);
+        goldRecipients.push(session.id);
+        shares[session.id] = 1.0;
       }
 
       this.eventBuffer.push({
@@ -373,9 +398,17 @@ export class GameRoom {
           element: m.element,
           x: m.x,
           y: m.y,
-          recipients: [session.id], // only the killer gets XP/gold (party sharing TBD)
+          // GDD §7 contribution-weighted recipients.  Each gets
+          // xp_per_player = m.xp * shares[id], gold_per_player =
+          // m.gold * shares[id] if their share >= 0.05.
+          recipients: xpRecipients,
+          goldRecipients,
+          shares,
         }
       });
+
+      // Clear contribution tracking for the next life of this monster.
+      m.dmgByPlayer = {};
     }
   }
 
