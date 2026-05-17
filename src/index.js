@@ -105,7 +105,8 @@ export class GameRoom {
     return Math.ceil(v);
   }
 
-  // Archetype definitions (mirrors client ARCHETYPES)
+  // Archetype definitions (mirrors client ARCHETYPES — keep in sync
+  // with src/data/gameSystems.js).
   _getArchetype(arch) {
     const ARCHETYPES = {
       fodder:   { hpMult: 0.6, dmgMult: 0.8, spdMult: 1.0, emoji: '🟢', color: '#3dd497' },
@@ -115,21 +116,25 @@ export class GameRoom {
       volatile: { hpMult: 0.8, dmgMult: 1.0, spdMult: 1.0, emoji: '💥', color: '#ea580c' },
       stalker:  { hpMult: 0.7, dmgMult: 1.2, spdMult: 1.3, emoji: '👁️', color: '#2C3E50' },
       hexer:    { hpMult: 0.9, dmgMult: 0.8, spdMult: 1.0, emoji: '💀', color: '#8E44AD' },
+      snowman:  { hpMult: 1.3, dmgMult: 1.1, spdMult: 0.8, emoji: '⛄', color: '#b0d8f0' },
     };
     return ARCHETYPES[arch] || ARCHETYPES.fodder;
   }
 
-  // Zone spawn definitions (mirrors client ZONES.spawns)
+  // Zone spawn definitions (mirrors client src/data/zones.js — frost
+  // is snowman-only, mist has no fodder, sky uses stalker/hexer/volatile,
+  // etc).  Server's wider w/h kept so existing bounds stay stable;
+  // level ranges flattened to [1,10] to match the client.
   _getZoneConfig(zoneId) {
     const ZONES = {
-      meadow:  { w:50, h:40, level:[1,10],  element:null,    spawns:[{arch:'fodder',count:10},{arch:'swarm',count:4}] },
-      ember:   { w:50, h:40, level:[1,10],  element:'flame', spawns:[{arch:'fodder',count:8},{arch:'brute',count:3},{arch:'volatile',count:2}] },
-      mist:    { w:50, h:40, level:[5,15],  element:'venom', spawns:[{arch:'fodder',count:6},{arch:'swarm',count:5},{arch:'hexer',count:2}] },
-      frost:   { w:50, h:40, level:[8,18],  element:'frost', spawns:[{arch:'fodder',count:7},{arch:'brute',count:3},{arch:'sentinel',count:2}] },
-      thunder: { w:50, h:40, level:[12,22], element:'storm', spawns:[{arch:'fodder',count:6},{arch:'volatile',count:3},{arch:'stalker',count:2}] },
-      hollows: { w:50, h:40, level:[18,28], element:'stone', spawns:[{arch:'brute',count:4},{arch:'sentinel',count:3},{arch:'stalker',count:2}] },
-      sky:     { w:50, h:40, level:[22,32], element:'wind',  spawns:[{arch:'swarm',count:6},{arch:'fodder',count:5},{arch:'volatile',count:2}] },
-      tidal:   { w:50, h:40, level:[15,25], element:'water', spawns:[{arch:'fodder',count:7},{arch:'swarm',count:4},{arch:'hexer',count:2}] },
+      meadow:  { w:50, h:40, level:[1,10], element:null,    spawns:[{arch:'fodder',count:10}] },
+      ember:   { w:50, h:40, level:[1,10], element:'flame', spawns:[{arch:'fodder',count:6},{arch:'brute',count:3},{arch:'volatile',count:4}] },
+      mist:    { w:50, h:40, level:[1,10], element:'venom', spawns:[{arch:'swarm',count:5},{arch:'stalker',count:3},{arch:'hexer',count:3}] },
+      frost:   { w:50, h:40, level:[1,10], element:'frost', spawns:[{arch:'snowman',count:4}] },
+      thunder: { w:50, h:40, level:[1,10], element:'storm', spawns:[{arch:'fodder',count:6},{arch:'volatile',count:4},{arch:'stalker',count:3}] },
+      hollows: { w:50, h:40, level:[1,10], element:'stone', spawns:[{arch:'brute',count:4},{arch:'sentinel',count:3},{arch:'swarm',count:4}] },
+      sky:     { w:50, h:40, level:[1,10], element:'wind',  spawns:[{arch:'stalker',count:4},{arch:'hexer',count:3},{arch:'volatile',count:3}] },
+      tidal:   { w:50, h:40, level:[1,10], element:'water', spawns:[{arch:'swarm',count:4},{arch:'hexer',count:4},{arch:'brute',count:3}] },
     };
     return ZONES[zoneId] || null;
   }
