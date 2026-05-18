@@ -80,9 +80,12 @@ export class GameRoom {
     this.MONSTER_ATTACK_CD = 1500; // ms
     this.TILE = 32;
 
-    // Idle timeout — drop sessions that haven't sent any message in this long.
-    // Client pongs ~every 3s, so 45s means ~15 missed pongs before eviction.
-    this.IDLE_TIMEOUT_MS = 45000;
+    // AFK timeout — drop sessions that haven't sent real input (move /
+    // combat / zone change / etc.) for this long.  Pong replies do NOT
+    // reset this clock (see webSocketMessage below), so a tab that's
+    // open but idle still gets booted instead of pinging forever and
+    // consuming a session slot + tick bandwidth.
+    this.IDLE_TIMEOUT_MS = 120000; // 2 minutes
 
     // On DO wake, close any hibernated sockets we don't have a session for.
     // These are orphans from prior wakes (crashed tabs, expired clients, etc.)
@@ -435,9 +438,14 @@ export class GameRoom {
   async webSocketMessage(ws, message) {
     const session = this.sessions.get(ws);
     if (!session) return;
-    session.lastRecv = Date.now();
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
+    // Reset the AFK clock on real input only.  Pong replies are
+    // keepalive heartbeats, not player activity -- counting them would
+    // mean the timeout fires only on TCP death, not on AFK players
+    // (the original 45 s behavior, which never actually kicked anyone
+    // who had a live tab open).
+    if (msg.type !== 'pong') session.lastRecv = Date.now();
 
     switch (msg.type) {
       case 'join':
