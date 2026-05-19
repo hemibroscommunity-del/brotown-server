@@ -466,6 +466,58 @@ export class GameRoom {
     return 1; // 'good' / 'ok' / unknown
   }
 
+  _harvestXpMult(accuracy) {
+    if (accuracy === 'perfect') return 2.0;
+    if (accuracy === 'good') return 1.5;
+    return 1.0; // 'ok' / unknown
+  }
+
+  _harvestSkillName(nodeType) {
+    if (nodeType === 'tree') return 'woodcutting';
+    if (nodeType === 'fishSpot') return 'fishing';
+    return 'mining';
+  }
+
+  // Base XP per harvest = ceil(tierLvl * 1.5 + 5); the accuracy
+  // multiplier (xpMult above) is applied on top.  Mirrors the client
+  // formula in createGatherNode (lifeSkills.js).
+  _harvestXpForTier(tierLvl, accuracy) {
+    const baseXp = Math.ceil(((tierLvl || 1) * 1.5) + 5);
+    return Math.ceil(baseXp * this._harvestXpMult(accuracy));
+  }
+
+  // lifeSkill level-up threshold curve.  Mirrors LIFE_SKILL_XP on the
+  // client (lifeSkills.js): ceil(500 * 1.08^(level - 1)).
+  _lifeSkillXpThreshold(level) {
+    return Math.ceil(500 * Math.pow(1.08, (level || 1) - 1));
+  }
+
+  // Apply XP to a lifeSkill, returns { leveled, newLevel }.  Mirrors
+  // addLifeSkillXp on the client; needs to stay byte-identical so
+  // local-vs-server level outcomes don't drift.
+  _addLifeSkillXp(ps, skill, xpAmt) {
+    if (!ps.lifeSkills) ps.lifeSkills = {};
+    if (!ps.lifeSkills[skill]) ps.lifeSkills[skill] = { level: 1, xp: 0 };
+    const s = ps.lifeSkills[skill];
+    s.xp = (s.xp || 0) + xpAmt;
+    let leveled = false;
+    while (s.xp >= this._lifeSkillXpThreshold(s.level || 1)) {
+      s.xp -= this._lifeSkillXpThreshold(s.level || 1);
+      s.level = (s.level || 1) + 1;
+      leveled = true;
+    }
+    return { leveled, newLevel: s.level };
+  }
+
+  // 33% shard drop per successful harvest (matches the client's
+  // rollHarvestShard rate; the monster-kill path uses 10% via
+  // _rollShardForKill above).  Server-rolled so a modified client
+  // can't force shard drops.
+  _rollHarvestShard(zoneId) {
+    if (Math.random() >= 0.33) return null;
+    return 'shard_' + zoneId;
+  }
+
   _handleNodeStrike(session, payload) {
     if (!session || !session.id) return;
     const { id, zone, accuracy } = payload || {};
@@ -495,13 +547,50 @@ export class GameRoom {
     const yieldQty = this._harvestYieldMult(accuracy);
     if (!ps.inventory) ps.inventory = {};
     ps.inventory[invKey] = (ps.inventory[invKey] || 0) + yieldQty;
+
+    /* lifeSkill XP -- server applies the XP gain and detects level-up.
+       Client used to do this via addLifeSkillXp(R.lifeSkills, ...);
+       now it predicts the popup locally but the authoritative
+       lifeSkills snapshot rides on the player_state event below. */
+    const skillName = this._harvestSkillName(n.nodeType);
+    const xpAmt = this._harvestXpForTier(n.tierLvl, accuracy);
+    const { leveled, newLevel } = this._addLifeSkillXp(ps, skillName, xpAmt);
+
+    /* Shard roll -- 33% per successful harvest.  Server-rolled so a
+       modified client can't force shard drops.  Goes straight into
+       inventory under shard_<zone> keyed off node.zone. */
+    const shard = this._rollHarvestShard(n.zoneId || zone);
+    if (shard) {
+      ps.inventory[shard] = (ps.inventory[shard] || 0) + 1;
+    }
+
     this._saveRpg(session.id, ps);
 
     /* Push the new authoritative totals to the picker.  Same
        player_state event the loot path uses; client OVERWRITES
-       R.inventory wholesale on receive. */
+       R.coins / R.inventory / R.lifeSkills wholesale on receive. */
     const ws = this._wsBySessionId(session.id);
-    if (ws) this._sendPlayerState(ws, session.id);
+    if (ws) {
+      this._sendPlayerState(ws, session.id);
+      /* Non-deterministic feedback the client can't predict on its
+         own (shard roll outcome + level-up confirmation): private
+         harvest_credit event so the client can fire the appropriate
+         floating popups. */
+      try {
+        ws.send(JSON.stringify({
+          type: 'harvest_credit',
+          payload: {
+            nodeId: id,
+            zone,
+            skillName,
+            xpAmt,
+            leveled,
+            newLevel,
+            shard,
+          },
+        }));
+      } catch (e) {}
+    }
   }
 
   // ═══ Server-authoritative loot ═══
@@ -557,6 +646,7 @@ export class GameRoom {
       await this.state.storage.put('rpg:' + playerId, {
         coins: ps.coins || 0,
         inventory: ps.inventory || {},
+        lifeSkills: ps.lifeSkills || {},
       });
     } catch (e) {}
   }
@@ -570,6 +660,7 @@ export class GameRoom {
         payload: {
           coins: ps.coins || 0,
           inventory: ps.inventory || {},
+          lifeSkills: ps.lifeSkills || {},
         },
       }));
     } catch (e) {}
@@ -935,9 +1026,11 @@ export class GameRoom {
           if (stored) {
             this.playerState[msg.id].coins = stored.coins || 0;
             this.playerState[msg.id].inventory = stored.inventory || {};
+            this.playerState[msg.id].lifeSkills = stored.lifeSkills || {};
           } else {
             this.playerState[msg.id].coins = (msg.data && typeof msg.data.rpgCoins === 'number') ? msg.data.rpgCoins : 0;
             this.playerState[msg.id].inventory = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? { ...msg.data.rpgInventory } : {};
+            this.playerState[msg.id].lifeSkills = (msg.data && msg.data.rpgLifeSkills && typeof msg.data.rpgLifeSkills === 'object') ? { ...msg.data.rpgLifeSkills } : {};
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
         }
