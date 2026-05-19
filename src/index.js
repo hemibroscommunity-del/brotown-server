@@ -466,6 +466,58 @@ export class GameRoom {
     return 'shard_' + zoneId;
   }
 
+  // ═══ Server-authoritative RPG state (coins + inventory) ═══
+  //
+  // The worker owns each player's coins and inventory.  Loot pickups
+  // (and, in future slices, sales / harvest / quest grants) apply
+  // increments here, persist to DO storage, and emit a player_state
+  // event so the client mirrors the authoritative totals -- a modified
+  // client overwriting R.coins locally gets stomped on the next sync.
+  //
+  // Bootstrap: on a player's first connection to this DO we don't have
+  // their state yet, so we read rpgCoins/rpgInventory from the join
+  // payload as the initial value.  Cheat surface (one-time, at first
+  // connect only); after that the server is the source.
+
+  _invKeyForSkull(skull) {
+    if (skull === 'fodder') return 'slime-remnants';
+    if (skull === 'fireGoblin') return 'fire-goblin-remnants';
+    return skull;
+  }
+
+  async _loadRpg(playerId) {
+    try {
+      const stored = await this.state.storage.get('rpg:' + playerId);
+      return stored || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async _saveRpg(playerId, ps) {
+    if (!playerId || !ps) return;
+    try {
+      await this.state.storage.put('rpg:' + playerId, {
+        coins: ps.coins || 0,
+        inventory: ps.inventory || {},
+      });
+    } catch (e) {}
+  }
+
+  _sendPlayerState(ws, playerId) {
+    const ps = this.playerState[playerId];
+    if (!ps || !ws) return;
+    try {
+      ws.send(JSON.stringify({
+        type: 'player_state',
+        payload: {
+          coins: ps.coins || 0,
+          inventory: ps.inventory || {},
+        },
+      }));
+    } catch (e) {}
+  }
+
   // Pile shape (server-side, full):
   //   { lootId, zone, x, y, coins, skull, shard, recipients,
   //     shares: {pid: number}, killerName, ts, inventoryClaimed,
@@ -611,9 +663,30 @@ export class GameRoom {
     }
     pile.claimedBy[session.id] = true;
 
+    // Apply the grant to server-tracked playerState (the authoritative
+    // store) BEFORE we emit the credit -- a cheating client that tries
+    // to manipulate the local R.coins value will get overwritten on
+    // the next player_state event we send.  Persist async; the in-
+    // memory state is what subsequent operations read.  Reusing the
+    // `ps` variable from the range check above.
+    ps.coins = (ps.coins || 0) + coinsForMe;
+    if (skullForMe) {
+      if (!ps.inventory) ps.inventory = {};
+      const invKey = this._invKeyForSkull(skullForMe);
+      ps.inventory[invKey] = (ps.inventory[invKey] || 0) + 1;
+    }
+    if (shardForMe) {
+      if (!ps.inventory) ps.inventory = {};
+      ps.inventory[shardForMe] = (ps.inventory[shardForMe] || 0) + 1;
+    }
+    this._saveRpg(session.id, ps);
+
     // Private credit to the picker -- this is the authoritative grant.
     // Goes direct via ws.send (not the room broadcast) so other clients
-    // can't see another player's per-share amount.
+    // can't see another player's per-share amount.  The accompanying
+    // player_state (sent right after) carries the new authoritative
+    // totals so the client can overwrite its local rpg state -- the
+    // loot_credit values are kept here for popup display only.
     const ws = this._wsBySessionId(session.id);
     if (ws) {
       try {
@@ -628,6 +701,7 @@ export class GameRoom {
           },
         }));
       } catch (e) {}
+      this._sendPlayerState(ws, session.id);
     }
 
     // Public broadcast: visual state changed (skull/shard removed from
@@ -793,6 +867,23 @@ export class GameRoom {
           ...msg.data
         };
         this.stateHistory[msg.id] = [];
+        /* Load (or bootstrap) the player's server-authoritative
+           coins + inventory.  Stored entry wins; if there's no
+           record yet, fall back to the values the client sent in
+           the join payload (one-time trust at first connection)
+           and persist them so subsequent connects use the stored
+           value. */
+        {
+          const stored = await this._loadRpg(msg.id);
+          if (stored) {
+            this.playerState[msg.id].coins = stored.coins || 0;
+            this.playerState[msg.id].inventory = stored.inventory || {};
+          } else {
+            this.playerState[msg.id].coins = (msg.data && typeof msg.data.rpgCoins === 'number') ? msg.data.rpgCoins : 0;
+            this.playerState[msg.id].inventory = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? { ...msg.data.rpgInventory } : {};
+            await this._saveRpg(msg.id, this.playerState[msg.id]);
+          }
+        }
         this.broadcastExcept(ws, { type: 'player_join', id: msg.id, name: msg.name, data: msg.data });
         // Send current state + monsters for player's zone
         const joinZone = msg.data?.z || 'town';
@@ -816,6 +907,12 @@ export class GameRoom {
           loot: zoneLootForJoin,
           monsterZone: joinZone,
         }));
+        /* Authoritative rpg state sync -- the client overwrites its
+           local R.coins / R.inventory with whatever's on the worker.
+           Bootstrap-from-join (above) means this matches what the
+           client just sent on the first connect, and matches the
+           stored value on subsequent connects. */
+        this._sendPlayerState(ws, msg.id);
         this.broadcastAll({ type: 'player_count', count: this.getPlayerCount() });
         this.reportToLeaderboard(session);
         break;
