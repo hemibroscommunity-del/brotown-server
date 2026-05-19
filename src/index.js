@@ -80,6 +80,14 @@ export class GameRoom {
     this.MONSTER_ATTACK_CD = 1500; // ms
     this.TILE = 32;
 
+    // Server-authoritative gather nodes (trees / fish spots / ore veins).
+    // Parallel to the monster pattern above: lazy-spawn on first player
+    // entry per zone, store in this.nodes, mark dirty on state change,
+    // tick respawns alongside _tickMonsters().
+    this.nodes = {}; // zoneId -> [node, ...]
+    this.dirtyNodes = new Set(); // zoneIds with changed node state
+    this.NODE_RESPAWN_TIME = 120000; // 2 min — matches client v2.3.30
+
     // AFK timeout — drop sessions that haven't sent real input (move /
     // combat / zone change / etc.) for this long.  Pong replies do NOT
     // reset this clock (see webSocketMessage below), so a tab that's
@@ -326,6 +334,109 @@ export class GameRoom {
     }
   }
 
+  // ═══ Gather nodes (trees / fish spots / ore veins) ═══
+  //
+  // The client owns the tier/name/flavor data tables (WOODCUTTING_TIERS
+  // / FISHING_TIERS / MINING_TIERS in src/data/lifeSkills.js).  The
+  // server only needs to know: how many of each type per zone, their
+  // positions, alive/respawnAt, and a tierLvl per node so two clients
+  // see the same tier (otherwise each client's createGatherNode() picks
+  // a tier via Math.random() and they diverge).
+  //
+  // tierLvl values for the "shallow" depth: 1 or 6 — that's the set of
+  // tier .lvl values <= 10 across all three tier tables.
+  _getShallowNodeTierLvls() {
+    return [1, 6]; // eligible tier .lvl values for depth=shallow
+  }
+
+  // Per-zone node count + type split — mirrors client lifeSkills.js
+  // spawnGatherNodes() for shallow depth (nodeCount=8: 40% tree, 25%
+  // fish, 35% ore -> 4 / 2 / 2).  Town and farm_home are skipped at
+  // the call sites.
+  _getZoneNodeConfig(zoneId) {
+    // Every combat zone gets the same shallow-depth mix today.  Custom
+    // per-zone tuning (e.g. extra fish spots in tidal) can land here
+    // later without touching the client.
+    return { treeCt: 4, fishCt: 2, oreCt: 2 };
+  }
+
+  // Spawn the static node layout for a zone.  Positions are randomized
+  // once at first-ever zone activation; after that they're fixed for
+  // the lifetime of the Durable Object (re-randomized only on DO wake).
+  _spawnZoneNodes(zoneId) {
+    const zone = this._getZoneConfig(zoneId);
+    if (!zone) return [];
+    const W = zone.w * this.TILE;
+    const H = zone.h * this.TILE;
+    const margin = 8 * this.TILE; // matches client lifeSkills.js inset
+    const cfg = this._getZoneNodeConfig(zoneId);
+    const tierLvls = this._getShallowNodeTierLvls();
+    const nodes = [];
+    let idx = 0;
+    const placeOne = (type) => {
+      const x = margin + Math.random() * (W - margin * 2);
+      const y = margin + Math.random() * (H - margin * 2);
+      const tierLvl = tierLvls[Math.floor(Math.random() * tierLvls.length)];
+      nodes.push({
+        id: 'sn-' + zoneId + '-' + idx,
+        nodeType: type,
+        x, y,
+        tierLvl,
+        alive: true,
+        respawnAt: 0,
+      });
+      idx++;
+    };
+    for (let i = 0; i < cfg.treeCt; i++) placeOne('tree');
+    for (let i = 0; i < cfg.fishCt; i++) placeOne('fishSpot');
+    for (let i = 0; i < cfg.oreCt; i++) placeOne('oreVein');
+    return nodes;
+  }
+
+  _ensureZoneNodes(zoneId) {
+    if (zoneId === 'town' || zoneId === 'farm_home') return [];
+    if (!this.nodes[zoneId]) {
+      this.nodes[zoneId] = this._spawnZoneNodes(zoneId);
+      if (this.nodes[zoneId].length > 0) this.dirtyNodes.add(zoneId);
+    }
+    return this.nodes[zoneId];
+  }
+
+  // Tick the node respawn loop — flip alive=true on any depleted node
+  // whose respawnAt has passed.  No need to scope to "active zones"
+  // like _tickMonsters; gather respawn is cheap and tiny.
+  _tickNodes() {
+    const now = Date.now();
+    for (const zoneId of Object.keys(this.nodes)) {
+      const list = this.nodes[zoneId];
+      if (!list || list.length === 0) continue;
+      let changed = false;
+      for (const n of list) {
+        if (!n.alive && n.respawnAt > 0 && now >= n.respawnAt) {
+          n.alive = true;
+          n.respawnAt = 0;
+          changed = true;
+        }
+      }
+      if (changed) this.dirtyNodes.add(zoneId);
+    }
+  }
+
+  // Process a player's harvest strike against a gather node.  The
+  // client's minigame already gates this on success (mining miss
+  // does NOT send node_strike), so we just validate and apply.
+  _handleNodeStrike(session, payload) {
+    const { id, zone } = payload || {};
+    if (!id || !zone) return;
+    const list = this.nodes[zone];
+    if (!list) return;
+    const n = list.find((x) => x.id === id);
+    if (!n || !n.alive) return;
+    n.alive = false;
+    n.respawnAt = Date.now() + this.NODE_RESPAWN_TIME;
+    this.dirtyNodes.add(zone);
+  }
+
   // Process player damage to a monster
   _handleMonsterDamage(session, payload) {
     const { monsterId, zone, dmg, isCrit, element } = payload;
@@ -462,6 +573,7 @@ export class GameRoom {
         // Send current state + monsters for player's zone
         const joinZone = msg.data?.z || 'town';
         const zoneMonsters = (joinZone !== 'town' && joinZone !== 'farm_home') ? this._ensureZoneMonsters(joinZone) : [];
+        const zoneNodes = (joinZone !== 'town' && joinZone !== 'farm_home') ? this._ensureZoneNodes(joinZone) : [];
         ws.send(JSON.stringify({
           type: 'state_sync',
           players: this.getAllPlayerData(),
@@ -471,6 +583,10 @@ export class GameRoom {
             x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp, dmg: m.dmg,
             xp: m.xp, gold: m.gold, spd: m.spd, emoji: m.emoji, color: m.color,
             alive: m.alive,
+          })),
+          nodes: zoneNodes.map(n => ({
+            id: n.id, nodeType: n.nodeType, x: n.x, y: n.y,
+            tierLvl: n.tierLvl, alive: n.alive, respawnAt: n.respawnAt,
           })),
           monsterZone: joinZone,
         }));
@@ -489,7 +605,7 @@ export class GameRoom {
           if (msg.dead !== undefined) ps.dead = !!msg.dead;
           this.dirtyPlayers.add(session.id);
 
-          // Zone change — send monster state for new zone
+          // Zone change — send monster + gather node state for new zone
           if (ps.z !== oldZone && ps.z !== 'town' && ps.z !== 'farm_home') {
             const newMonsters = this._ensureZoneMonsters(ps.z);
             ws.send(JSON.stringify({
@@ -500,6 +616,15 @@ export class GameRoom {
                 x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp, dmg: m.dmg,
                 xp: m.xp, gold: m.gold, spd: m.spd, emoji: m.emoji, color: m.color,
                 alive: m.alive,
+              })),
+            }));
+            const newNodes = this._ensureZoneNodes(ps.z);
+            ws.send(JSON.stringify({
+              type: 'zone_nodes',
+              zone: ps.z,
+              nodes: newNodes.map(n => ({
+                id: n.id, nodeType: n.nodeType, x: n.x, y: n.y,
+                tierLvl: n.tierLvl, alive: n.alive, respawnAt: n.respawnAt,
               })),
             }));
           }
@@ -533,6 +658,15 @@ export class GameRoom {
         // Client reports damage dealt to a server monster
         if (session.id) {
           this._handleMonsterDamage(session, msg.payload || msg);
+        }
+        break;
+
+      case 'node_strike':
+        // Client reports a successful harvest action on a gather node.
+        // The minigame already gates this on success (mining miss does
+        // NOT send), so we just validate and apply.
+        if (session.id) {
+          this._handleNodeStrike(session, msg.payload || msg);
         }
         break;
 
@@ -654,6 +788,9 @@ export class GameRoom {
       // Monster AI tick
       this._tickMonsters();
 
+      // Gather-node respawn tick (cheap; iterates Object.keys(this.nodes))
+      this._tickNodes();
+
       // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
       if (pingCounter >= 90) {
@@ -673,7 +810,8 @@ export class GameRoom {
       const hasDirty = this.dirtyPlayers.size > 0;
       const hasEvents = this.eventBuffer.length > 0;
       const hasMonsters = this.dirtyMonsters.size > 0;
-      if (!hasDirty && !hasEvents && !hasMonsters) { this.tickSeq++; return; }
+      const hasNodes = this.dirtyNodes.size > 0;
+      if (!hasDirty && !hasEvents && !hasMonsters && !hasNodes) { this.tickSeq++; return; }
 
       // Build single room-wide tick delta
       const delta = { type: 'tick', seq: this.tickSeq++, ts: Date.now() };
@@ -710,6 +848,22 @@ export class GameRoom {
         }
         delta.monsters = mData;
         this.dirtyMonsters.clear();
+      }
+
+      // Gather-node deltas — only state-change fields (alive / respawnAt).
+      // The full node payload (type / x / y / tierLvl) is sent once at
+      // state_sync or zone_nodes; the client already has the position.
+      if (hasNodes) {
+        const nData = {};
+        for (const zoneId of this.dirtyNodes) {
+          const list = this.nodes[zoneId];
+          if (!list) continue;
+          nData[zoneId] = list.map((n) => ({
+            id: n.id, alive: n.alive, respawnAt: n.respawnAt,
+          }));
+        }
+        delta.nodes = nData;
+        this.dirtyNodes.clear();
       }
 
       const msg = JSON.stringify(delta);
