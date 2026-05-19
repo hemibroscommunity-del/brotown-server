@@ -435,16 +435,73 @@ export class GameRoom {
   // Process a player's harvest strike against a gather node.  The
   // client's minigame already gates this on success (mining miss
   // does NOT send node_strike), so we just validate and apply.
+  // Tier + resource key mappings for gather nodes.  Hardcoded on the
+  // server so the client can't cheat the harvest by lying about what
+  // tier was struck.  Limited to the "shallow" depth tier set today
+  // (tierLvl 1 + 6); extend if/when deeper depths reach the server.
+  _harvestNameForTier(nodeType, tierLvl) {
+    const TREE = { 1: 'Kindling', 6: 'Softwood' };
+    const FISH = { 1: 'Minnow',   6: 'Clownfish' };
+    const ORE  = { 1: 'Copper Ore', 6: 'Iron Ore' };
+    const t = tierLvl || 1;
+    if (nodeType === 'tree') return TREE[t] || TREE[1];
+    if (nodeType === 'fishSpot') return FISH[t] || FISH[1];
+    return ORE[t] || ORE[1];
+  }
+
+  _harvestResourceType(nodeType) {
+    if (nodeType === 'tree') return 'wood';
+    if (nodeType === 'fishSpot') return 'fish';
+    return 'ore';
+  }
+
+  _harvestInvKey(nodeType, tierLvl) {
+    const name = this._harvestNameForTier(nodeType, tierLvl);
+    const resType = this._harvestResourceType(nodeType);
+    return resType + '_' + name.replace(/\s+/g, '_').toLowerCase();
+  }
+
+  _harvestYieldMult(accuracy) {
+    if (accuracy === 'perfect') return 2;
+    return 1; // 'good' / 'ok' / unknown
+  }
+
   _handleNodeStrike(session, payload) {
-    const { id, zone } = payload || {};
+    if (!session || !session.id) return;
+    const { id, zone, accuracy } = payload || {};
     if (!id || !zone) return;
     const list = this.nodes[zone];
     if (!list) return;
     const n = list.find((x) => x.id === id);
     if (!n || !n.alive) return;
+    /* Position gate -- player must actually be near the node.  The
+       client's minigame wouldn't open without proximity but a
+       handcrafted node_strike would; check anyway. */
+    const ps = this.playerState[session.id];
+    if (!ps || ps.z !== zone || ps.dead || ps.disconnected) return;
+    const dx = ps.x - n.x;
+    const dy = ps.y - n.y;
+    if (dx * dx + dy * dy > this.LOOT_PICKUP_RANGE * this.LOOT_PICKUP_RANGE) return;
+
     n.alive = false;
     n.respawnAt = Date.now() + this.NODE_RESPAWN_TIME;
     this.dirtyNodes.add(zone);
+
+    /* Apply the inventory grant server-side and persist.  Client used
+       to do this in _applyFishingReward / _applyWoodReward /
+       _applyMiningReward; now it just sends node_strike with the
+       accuracy and waits for the player_state event we emit below. */
+    const invKey = this._harvestInvKey(n.nodeType, n.tierLvl);
+    const yieldQty = this._harvestYieldMult(accuracy);
+    if (!ps.inventory) ps.inventory = {};
+    ps.inventory[invKey] = (ps.inventory[invKey] || 0) + yieldQty;
+    this._saveRpg(session.id, ps);
+
+    /* Push the new authoritative totals to the picker.  Same
+       player_state event the loot path uses; client OVERWRITES
+       R.inventory wholesale on receive. */
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
   }
 
   // ═══ Server-authoritative loot ═══
