@@ -88,6 +88,16 @@ export class GameRoom {
     this.dirtyNodes = new Set(); // zoneIds with changed node state
     this.NODE_RESPAWN_TIME = 120000; // 2 min — matches client v2.3.30
 
+    // Server-authoritative ground loot.  Worker owns the canonical pile
+    // list per zone; clients render from broadcasts and send pickup
+    // requests via loot_pickup.  Server validates each pickup (range,
+    // recipient, single-claim) and emits a private loot_credit back to
+    // the picker with their authorized share + any one-of inventory.
+    this.loot = {}; // zoneId -> [pile, ...]
+    this.LOOT_EXPIRY_MS = 60000;
+    this.LOOT_PICKUP_RANGE = 30; // px; slightly looser than client's 20 to absorb position lag
+    this.SHARD_DROP_RATE = 0.10; // 10% per kill, matches client rollMonsterShard
+
     // AFK timeout — drop sessions that haven't sent real input (move /
     // combat / zone change / etc.) for this long.  Pong replies do NOT
     // reset this clock (see webSocketMessage below), so a tab that's
@@ -437,6 +447,204 @@ export class GameRoom {
     this.dirtyNodes.add(zone);
   }
 
+  // ═══ Server-authoritative loot ═══
+  //
+  // The worker owns the ground-loot list per zone.  When a monster
+  // dies in _handleMonsterDamage, we compute the contribution-weighted
+  // recipients (existing code) and ALSO push a pile object into
+  // this.loot[zone] with the total gold, optional skull/shard, and the
+  // recipients list.  Pickup is a client request (loot_pickup); the
+  // server checks position + recipient + not-already-claimed and emits
+  // a private loot_credit to the picker with their share.  Public
+  // loot_claimed broadcasts visibility changes; loot_despawn finalises.
+  _isRemnantSkullArch(arch) {
+    return arch === 'fodder' || arch === 'snowman' || arch === 'fireGoblin' || arch === 'mummy' || arch === 'skeleton';
+  }
+
+  _rollShardForKill(zoneId) {
+    if (Math.random() >= this.SHARD_DROP_RATE) return null;
+    return 'shard_' + zoneId;
+  }
+
+  // Pile shape (server-side, full):
+  //   { lootId, zone, x, y, coins, skull, shard, recipients,
+  //     shares: {pid: number}, killerName, ts, inventoryClaimed,
+  //     claimedBy: {pid: true} }
+  _spawnLootForKill(zone, monster, killerSessionId, recipients, shares) {
+    const lootId = 'mk-' + monster.id;
+    const skull = this._isRemnantSkullArch(monster.arch) ? monster.arch : null;
+    const shard = this._rollShardForKill(zone);
+    if (!skull && (!recipients || recipients.length === 0) && monster.gold <= 0 && !shard) {
+      // Nothing of value would drop -- skip the pile entirely.
+      return null;
+    }
+    const killerSession = this._sessionById(killerSessionId);
+    const killerName = (killerSession && killerSession.name) || 'Player';
+    const pile = {
+      lootId,
+      zone,
+      x: monster.x,
+      y: monster.y,
+      coins: monster.gold || 0,
+      skull,
+      shard,
+      recipients: recipients.slice(),
+      shares: { ...shares },
+      killerName,
+      ts: Date.now(),
+      inventoryClaimed: false,
+      claimedBy: {},
+    };
+    if (!this.loot[zone]) this.loot[zone] = [];
+    this.loot[zone].push(pile);
+    return pile;
+  }
+
+  // Serialize a pile for the wire.  Strips server-only fields
+  // (claimedBy) and keeps just what clients need to render + decide
+  // visual state.  inventoryClaimed is part of the wire because
+  // late-joiners + zone-change syncs need it.
+  _serializePile(p) {
+    return {
+      lootId: p.lootId,
+      zone: p.zone,
+      x: p.x, y: p.y,
+      coins: p.coins,
+      skull: p.skull,
+      shard: p.shard,
+      recipients: p.recipients,
+      shares: p.shares,
+      killerName: p.killerName,
+      ts: p.ts,
+      inventoryClaimed: p.inventoryClaimed,
+    };
+  }
+
+  _zoneLootForWire(zone) {
+    const list = this.loot[zone] || [];
+    return list.map((p) => this._serializePile(p));
+  }
+
+  _sessionById(sessionId) {
+    for (const [, s] of this.sessions) {
+      if (s.id === sessionId) return s;
+    }
+    return null;
+  }
+
+  _wsBySessionId(sessionId) {
+    for (const [ws, s] of this.sessions) {
+      if (s.id === sessionId) return ws;
+    }
+    return null;
+  }
+
+  _despawnLoot(zone, lootId) {
+    const list = this.loot[zone];
+    if (!list) return;
+    const idx = list.findIndex((p) => p.lootId === lootId);
+    if (idx < 0) return;
+    list.splice(idx, 1);
+    this.eventBuffer.push({
+      type: 'loot_despawn',
+      payload: { lootId, zone },
+    });
+  }
+
+  _tickLoot() {
+    const now = Date.now();
+    for (const zoneId of Object.keys(this.loot)) {
+      const list = this.loot[zoneId];
+      if (!list) continue;
+      // Walk back-to-front so splice is safe.
+      for (let i = list.length - 1; i >= 0; i--) {
+        const p = list[i];
+        if (now - p.ts > this.LOOT_EXPIRY_MS) {
+          list.splice(i, 1);
+          this.eventBuffer.push({
+            type: 'loot_despawn',
+            payload: { lootId: p.lootId, zone: zoneId },
+          });
+        }
+      }
+    }
+  }
+
+  _handleLootPickup(session, payload) {
+    if (!session || !session.id) return;
+    const { lootId, zone } = payload || {};
+    if (!lootId || !zone) return;
+    const list = this.loot[zone];
+    if (!list) return;
+    const pile = list.find((p) => p.lootId === lootId);
+    if (!pile) return;
+
+    // Already claimed this pile?  Per-player single claim for gold;
+    // inventory is single-claim across the pile.
+    if (pile.claimedBy[session.id]) return;
+
+    // Recipient gate.
+    if (!pile.recipients.includes(session.id)) return;
+
+    // Range gate -- player must be near the pile per server-tracked
+    // position.  Slightly looser than the client's 20 px to absorb
+    // the 100 ms+ position lag between move events.
+    const ps = this.playerState[session.id];
+    if (!ps || ps.z !== zone || ps.dead || ps.disconnected) return;
+    const dx = ps.x - pile.x;
+    const dy = ps.y - pile.y;
+    if (dx * dx + dy * dy > this.LOOT_PICKUP_RANGE * this.LOOT_PICKUP_RANGE) return;
+
+    // Compute the player's authorized share.
+    const share = pile.shares[session.id] || 0;
+    const coinsForMe = Math.round(pile.coins * share);
+
+    // First picker also gets the one-of inventory drop.
+    let skullForMe = null;
+    let shardForMe = null;
+    let inventoryClaimedNow = false;
+    if (!pile.inventoryClaimed) {
+      if (pile.skull || pile.shard) inventoryClaimedNow = true;
+      skullForMe = pile.skull || null;
+      shardForMe = pile.shard || null;
+      pile.inventoryClaimed = true;
+    }
+    pile.claimedBy[session.id] = true;
+
+    // Private credit to the picker -- this is the authoritative grant.
+    // Goes direct via ws.send (not the room broadcast) so other clients
+    // can't see another player's per-share amount.
+    const ws = this._wsBySessionId(session.id);
+    if (ws) {
+      try {
+        ws.send(JSON.stringify({
+          type: 'loot_credit',
+          payload: {
+            lootId,
+            zone,
+            coins: coinsForMe,
+            skull: skullForMe,
+            shard: shardForMe,
+          },
+        }));
+      } catch (e) {}
+    }
+
+    // Public broadcast: visual state changed (skull/shard removed from
+    // the rendered pile, picker logged for future "X claimed" feedback
+    // if the client wants it).
+    this.eventBuffer.push({
+      type: 'loot_claimed',
+      payload: { lootId, zone, byPlayer: session.id, inventoryClaimedNow },
+    });
+
+    // If every recipient has now claimed, the pile is fully spent --
+    // despawn so watchers stop seeing it.
+    if (Object.keys(pile.claimedBy).length >= pile.recipients.length) {
+      this._despawnLoot(zone, lootId);
+    }
+  }
+
   // Process player damage to a monster
   _handleMonsterDamage(session, payload) {
     const { monsterId, zone, dmg, isCrit, element } = payload;
@@ -527,6 +735,22 @@ export class GameRoom {
         }
       });
 
+      // Server-authoritative loot drop.  The pile lives on the worker;
+      // clients render it from the broadcast and request pickup via
+      // loot_pickup.  Cheaters can't credit themselves coins/inventory
+      // without a server-emitted loot_credit acknowledging a valid
+      // pickup request (range + recipient + single-claim gates in
+      // _handleLootPickup).  The client still applies the credit to
+      // local rpg state -- moving that store to the worker is a
+      // follow-up slice.
+      const pile = this._spawnLootForKill(zone, m, session.id, goldRecipients, shares);
+      if (pile) {
+        this.eventBuffer.push({
+          type: 'loot_drop',
+          payload: { pile: this._serializePile(pile) },
+        });
+      }
+
       // Clear contribution tracking for the next life of this monster.
       m.dmgByPlayer = {};
     }
@@ -574,6 +798,7 @@ export class GameRoom {
         const joinZone = msg.data?.z || 'town';
         const zoneMonsters = (joinZone !== 'town' && joinZone !== 'farm_home') ? this._ensureZoneMonsters(joinZone) : [];
         const zoneNodes = (joinZone !== 'town' && joinZone !== 'farm_home') ? this._ensureZoneNodes(joinZone) : [];
+        const zoneLootForJoin = (joinZone !== 'town' && joinZone !== 'farm_home') ? this._zoneLootForWire(joinZone) : [];
         ws.send(JSON.stringify({
           type: 'state_sync',
           players: this.getAllPlayerData(),
@@ -588,6 +813,7 @@ export class GameRoom {
             id: n.id, nodeType: n.nodeType, x: n.x, y: n.y,
             tierLvl: n.tierLvl, alive: n.alive, respawnAt: n.respawnAt,
           })),
+          loot: zoneLootForJoin,
           monsterZone: joinZone,
         }));
         this.broadcastAll({ type: 'player_count', count: this.getPlayerCount() });
@@ -626,6 +852,11 @@ export class GameRoom {
                 id: n.id, nodeType: n.nodeType, x: n.x, y: n.y,
                 tierLvl: n.tierLvl, alive: n.alive, respawnAt: n.respawnAt,
               })),
+            }));
+            ws.send(JSON.stringify({
+              type: 'zone_loot',
+              zone: ps.z,
+              loot: this._zoneLootForWire(ps.z),
             }));
           }
         }
@@ -667,6 +898,15 @@ export class GameRoom {
         // NOT send), so we just validate and apply.
         if (session.id) {
           this._handleNodeStrike(session, msg.payload || msg);
+        }
+        break;
+
+      case 'loot_pickup':
+        // Client requests to pick up a loot pile.  Server validates
+        // (range, recipient, single-claim) and emits a private
+        // loot_credit back to the picker with their authorized share.
+        if (session.id) {
+          this._handleLootPickup(session, msg.payload || msg);
         }
         break;
 
@@ -790,6 +1030,10 @@ export class GameRoom {
 
       // Gather-node respawn tick (cheap; iterates Object.keys(this.nodes))
       this._tickNodes();
+
+      // Loot pile expiry tick -- piles older than LOOT_EXPIRY_MS get
+      // despawned with a broadcast event so clients drop them too.
+      this._tickLoot();
 
       // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
