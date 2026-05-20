@@ -519,6 +519,30 @@ export class GameRoom {
     return 1.0; // 'ok' / unknown
   }
 
+  // Slice 18: rate-limit 'perfect' harvest claims.  The minigame
+  // outcome is still client-trusted (server doesn't simulate the
+  // minigame), so a cheater could spam accuracy:'perfect' for the
+  // doubled yield + XP.  Bound it: only HARVEST_PERFECT_PER_MIN
+  // "perfect" claims accepted per 60s window per player; excess
+  // downgrades to 'good' (keeps the XP bonus a skilled player
+  // would earn but drops the yield doubler).
+  //
+  // 10/min = 1 every 6 sec, well above the realistic minigame
+  // cadence for legit play (each fishing / mining / wood-chop
+  // minigame takes several seconds + walk-to-next-node time).
+  _ratedHarvestAccuracy(ps, claimed) {
+    if (claimed !== 'perfect') return claimed || 'ok';
+    const now = Date.now();
+    if (!Array.isArray(ps._perfectHistory)) ps._perfectHistory = [];
+    // Prune entries older than 60 sec.
+    ps._perfectHistory = ps._perfectHistory.filter((t) => (now - t) < 60000);
+    if (ps._perfectHistory.length >= 10) {
+      return 'good'; // cap exceeded
+    }
+    ps._perfectHistory.push(now);
+    return 'perfect';
+  }
+
   _harvestSkillName(nodeType) {
     if (nodeType === 'tree') return 'woodcutting';
     if (nodeType === 'fishSpot') return 'fishing';
@@ -1365,9 +1389,12 @@ export class GameRoom {
     /* Apply the inventory grant server-side and persist.  Client used
        to do this in _applyFishingReward / _applyWoodReward /
        _applyMiningReward; now it just sends node_strike with the
-       accuracy and waits for the player_state event we emit below. */
+       accuracy and waits for the player_state event we emit below.
+       Slice 18: rate-limit 'perfect' claims so a cheater can't spam
+       perfect-accuracy for the doubled yield + XP. */
+    const ratedAccuracy = this._ratedHarvestAccuracy(ps, accuracy);
     const invKey = this._harvestInvKey(n.nodeType, n.tierLvl);
-    const yieldQty = this._harvestYieldMult(accuracy);
+    const yieldQty = this._harvestYieldMult(ratedAccuracy);
     if (!ps.inventory) ps.inventory = {};
     ps.inventory[invKey] = (ps.inventory[invKey] || 0) + yieldQty;
 
@@ -1376,7 +1403,7 @@ export class GameRoom {
        now it predicts the popup locally but the authoritative
        lifeSkills snapshot rides on the player_state event below. */
     const skillName = this._harvestSkillName(n.nodeType);
-    const xpAmt = this._harvestXpForTier(n.tierLvl, accuracy);
+    const xpAmt = this._harvestXpForTier(n.tierLvl, ratedAccuracy);
     const { leveled, newLevel } = this._addLifeSkillXp(ps, skillName, xpAmt);
 
     /* Shard roll -- 33% per successful harvest.  Server-rolled so a
