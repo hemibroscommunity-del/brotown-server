@@ -623,6 +623,63 @@ export class GameRoom {
     }
   }
 
+  // ═══ Eating cooked fish (server-authoritative HP heal) ═══
+  //
+  // Client sends eat_request { invKey } when the player clicks Eat on
+  // a cooked_fish_* inventory item.  Server validates the player owns
+  // at least one of the item, looks up the heal amount from the
+  // hardcoded fish-tier table (mirrors client getFishHealAmount in
+  // gameSystems.js), decrements inventory, increments hp (clamped to
+  // maxHp), persists, and emits player_state.
+  //
+  // Closes the "eat to heal beyond what server thinks" cheat: server
+  // applies the heal, so a modified client that bypasses inventory
+  // decrement still gets stomped on the next player_state.  Mirrors
+  // FISHING_TIERS from src/data/lifeSkills.js -- keep in sync if new
+  // fish tiers ship to the client.
+  _fishHealAmount(invKey) {
+    if (typeof invKey !== 'string') return 0;
+    if (!invKey.startsWith('cooked_fish_') && !invKey.startsWith('fish_')) return 0;
+    // Strip 'fish_' or 'cooked_fish_' prefix to get the species name.
+    const species = invKey.replace(/^(cooked_)?fish_/, '').toLowerCase();
+    const TIERS = [
+      { lvl: 1,  name: 'minnow' },
+      { lvl: 6,  name: 'clownfish' },
+      { lvl: 11, name: 'trout' },
+    ];
+    const tier = TIERS.find((t) => species.includes(t.name));
+    if (!tier) return 20; // default for unmapped cooked fish
+    return Math.ceil(15 + tier.lvl * 8);
+  }
+
+  _handleEatRequest(session, payload) {
+    if (!session || !session.id) return;
+    const { invKey } = payload || {};
+    if (typeof invKey !== 'string') return;
+    // Only cooked_fish_* keys are edible this slice; raw fish goes
+    // through cook_request first.
+    if (!invKey.startsWith('cooked_fish_')) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    if (!ps.inventory) ps.inventory = {};
+    if ((ps.inventory[invKey] || 0) <= 0) return;
+    const heal = this._fishHealAmount(invKey);
+    if (heal <= 0) return;
+    // Decrement inventory + apply heal.  Heal is "wasted" if at max;
+    // we still consume the item to match client semantics (the click
+    // handler returns early at full, but a race-condition cheater
+    // could trigger this server-side -- consume anyway).
+    ps.inventory[invKey] -= 1;
+    if (ps.inventory[invKey] <= 0) delete ps.inventory[invKey];
+    if (typeof ps.maxHp !== 'number') ps.maxHp = 100;
+    if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
+    ps.hp = Math.min(ps.maxHp, ps.hp + heal);
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   // ═══ Cooking (raw fish -> cooked / burnt) ═══
   //
   // Client sends cook_request { fishKey, kind } when the cooking
@@ -1661,6 +1718,15 @@ export class GameRoom {
         // or the swipe ramp, validates, deducts, and emits player_state.
         if (session.id) {
           this._handleAbilityUse(session, msg.payload || msg);
+        }
+        break;
+
+      case 'eat_request':
+        // Player clicked Eat on a cooked_fish_* inventory item.
+        // Server validates ownership, consumes 1, heals hp, emits
+        // player_state.
+        if (session.id) {
+          this._handleEatRequest(session, msg.payload || msg);
         }
         break;
 
