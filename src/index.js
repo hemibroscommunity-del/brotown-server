@@ -725,6 +725,42 @@ export class GameRoom {
   // actually exists in the player's stash / active slot before
   // crediting coins or pushing to the marketplace.
   //
+  // Mirror of WEAPON_TYPES base damage values from
+  // src/data/gameSystems.js.  Used for sell-value math and (later)
+  // server-computed weapon damage.  Keep in sync if new weapon types
+  // ship to the client.
+  _weaponBase(type) {
+    const T = { greatsword: 48, sword: 32, bow: 35, staff: 41 };
+    return T[type] || 30;
+  }
+
+  // Sell value mirrors the client at BroTown.jsx ~26613:
+  //   ceil((tierMult || 1) * (WEAPON_TYPES[type].base || 30) * 0.5)
+  _weaponSellValue(weapon) {
+    if (!weapon) return 0;
+    const tierMult = (typeof weapon.tierMult === 'number' && weapon.tierMult > 0) ? weapon.tierMult : 1;
+    const base = this._weaponBase(weapon.type);
+    return Math.max(1, Math.ceil(tierMult * base * 0.5));
+  }
+
+  _handleSellWeapon(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const { stashIdx } = payload || {};
+    if (!Number.isInteger(stashIdx) || stashIdx < 0) return;
+    if (!Array.isArray(ps.weaponStash) || stashIdx >= ps.weaponStash.length) return;
+    const weapon = ps.weaponStash[stashIdx];
+    if (!weapon) return;
+    const sellVal = this._weaponSellValue(weapon);
+    ps.weaponStash.splice(stashIdx, 1);
+    ps.coins = (ps.coins || 0) + sellVal;
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   // equip_request swaps a stash entry with an active equipment slot.
   // Server validates stashIdx is in range + slot name is known.
   // (WEAPON_STASH_CAP set in constructor; mirrors WEAPON_STASH_MAX
@@ -2340,6 +2376,15 @@ export class GameRoom {
         // emits player_state with the new equipment layout.
         if (session.id) {
           this._handleEquipRequest(session, msg.payload || msg);
+        }
+        break;
+
+      case 'sell_weapon':
+        // Sell a weaponStash entry to an NPC for coins.  Server
+        // validates ownership + computes sell value, credits coins,
+        // emits player_state.
+        if (session.id) {
+          this._handleSellWeapon(session, msg.payload || msg);
         }
         break;
 
