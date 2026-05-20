@@ -591,12 +591,16 @@ export class GameRoom {
     ps.xp = (ps.xp || 0) + (xpAmt || 0);
     ps.unspentT2 = ps.unspentT2 || 0;
     let levelsGained = 0;
-    while (ps.xp >= this._xpRequiredForLevel(ps.level)) {
+    const LEVEL_CAP = 100;
+    while (ps.level < LEVEL_CAP && ps.xp >= this._xpRequiredForLevel(ps.level)) {
       ps.xp -= this._xpRequiredForLevel(ps.level);
       ps.level += 1;
       ps.unspentT2 += 5;
       levelsGained += 1;
     }
+    // At cap, drop any further xp so the counter doesn't overflow
+    // Number.MAX_SAFE_INTEGER after extreme play.
+    if (ps.level >= LEVEL_CAP) ps.xp = 0;
     return { leveled: levelsGained > 0, levelsGained, newLevel: ps.level };
   }
 
@@ -735,23 +739,33 @@ export class GameRoom {
     return RECIPES[idx];
   }
 
-  // Match-then-consume helper.  The client uses k.includes(type) to
-  // find inventory keys matching an ingredient type (e.g. ingredient
-  // "herb_firebloom" matches any key containing that substring).
-  // Replicate exactly so the server sees the same available count.
+  // Match-then-consume helper.  Mirrors the CLIENT's behavior but with
+  // a stricter matcher: client uses bare k.includes(type), which would
+  // unintentionally match unrelated inventory keys that happen to
+  // contain the type string as a substring (e.g. "shard_herb_firebloom"
+  // would be consumed by a "herb_firebloom" ingredient).  We restrict
+  // matches to k === type OR k === ('cooked_' + type) so only the
+  // canonical inventory key (and its cooked variant) is consumed.
+  // Client matches more loosely; the divergence means the server may
+  // refuse some recipes the client would accept, but that's safer than
+  // the inverse.
+  _ingredientMatches(invKey, type) {
+    return invKey === type || invKey === ('cooked_' + type);
+  }
+
   _consumeIngredient(ps, type, count) {
     if (!ps.inventory) return false;
     let remaining = count;
     // First pass: count availability across matching keys.
     let total = 0;
     for (const [k, v] of Object.entries(ps.inventory)) {
-      if (k.includes(type) && v > 0) total += v;
+      if (this._ingredientMatches(k, type) && v > 0) total += v;
     }
     if (total < count) return false;
     // Second pass: consume from matching keys until satisfied.
     for (const k of Object.keys(ps.inventory)) {
       if (remaining <= 0) break;
-      if (!k.includes(type) || ps.inventory[k] <= 0) continue;
+      if (!this._ingredientMatches(k, type) || ps.inventory[k] <= 0) continue;
       const take = Math.min(ps.inventory[k], remaining);
       ps.inventory[k] -= take;
       remaining -= take;
@@ -775,7 +789,7 @@ export class GameRoom {
     for (const [type, count] of Object.entries(recipe.ingredients)) {
       let total = 0;
       for (const [k, v] of Object.entries(ps.inventory)) {
-        if (k.includes(type) && v > 0) total += v;
+        if (this._ingredientMatches(k, type) && v > 0) total += v;
       }
       if (total < count) return;
     }
@@ -1040,8 +1054,23 @@ export class GameRoom {
     }
   }
 
+  // Prune expired buff entries from ps._buffs.  _buffActive treats
+  // past timestamps as inactive, but unpruned entries would otherwise
+  // accumulate forever (each persisted to storage).  Called from
+  // _saveRpg so pruning lands every time we persist.
+  _pruneBuffs(ps) {
+    if (!ps || !ps._buffs) return;
+    const now = Date.now();
+    for (const k of Object.keys(ps._buffs)) {
+      if (typeof ps._buffs[k] !== 'number' || ps._buffs[k] <= now) {
+        delete ps._buffs[k];
+      }
+    }
+  }
+
   async _saveRpg(playerId, ps) {
     if (!playerId || !ps) return;
+    this._pruneBuffs(ps);
     try {
       await this.state.storage.put('rpg:' + playerId, {
         coins: ps.coins || 0,
@@ -1218,19 +1247,28 @@ export class GameRoom {
     if (statsChanged) {
       this._recomputeMaxes(ps);
     }
-    // Session-only equipment-derived values still flow from client.
-    // These don't bypass the maxHp cheat because they don't change
-    // the pool size -- def affects damage reduction, amulet*Regen
-    // affects regen tick rate.  The pool size is server-computed.
-    if (typeof payload.def === 'number') ps.def = Math.max(0, payload.def);
-    if (typeof payload.amuletHpRegen === 'number') ps.amuletHpRegen = Math.max(0, payload.amuletHpRegen);
-    if (typeof payload.amuletStaminaRegen === 'number') ps.amuletStaminaRegen = Math.max(0, payload.amuletStaminaRegen);
-    // restoration + influence are also raw stats above; the duplicate
-    // assignments below are no-ops when those fields are present in
-    // the raw-stat loop, kept for backward compat if the client only
-    // sends these two.
-    if (typeof payload.restoration === 'number' && typeof ps.restoration !== 'number') ps.restoration = Math.max(0, payload.restoration);
-    if (typeof payload.influence === 'number' && typeof ps.influence !== 'number') ps.influence = Math.max(0, payload.influence);
+    // Session-only equipment-derived values flow from client but are
+    // capped to per-level bounds.  Without a cap, a cheater can push
+    // def: 999999 and take 1 damage forever (since _applyDamage's
+    // `max(1, ceil(r - def * 0.3))` floors at 1).  Same risk for
+    // amulet regen mults (60k HP/regen tick).
+    //
+    // def cap: max armor tier mult is 5 + endurance contribution. At
+    // level N, max endurance = level*10+20, contributing 0.5x.  Max
+    // armor.tierMult = 5, contributing 3x.  So legit max def = (level*10+20)*0.5 + 15.
+    // Cap at 4x that to leave headroom for unknown equipment additions.
+    const defCap = lvl * 20 + 100;
+    if (typeof payload.def === 'number') {
+      ps.def = Math.max(0, Math.min(defCap, payload.def));
+    }
+    // Amulet regen mults are percentages.  Real amulets cap around 30%
+    // per tier; 100% is double, well above any realistic stack.
+    if (typeof payload.amuletHpRegen === 'number') {
+      ps.amuletHpRegen = Math.max(0, Math.min(100, payload.amuletHpRegen));
+    }
+    if (typeof payload.amuletStaminaRegen === 'number') {
+      ps.amuletStaminaRegen = Math.max(0, Math.min(100, payload.amuletStaminaRegen));
+    }
     // Persist (raw stats + pool values get carried via _saveRpg).
     this._saveRpg(session.id, ps);
     const ws = this._wsBySessionId(session.id);
@@ -1668,7 +1706,10 @@ export class GameRoom {
     const dmgCap = this._maxDmgForLevel(attackerPs ? attackerPs.level : 1);
     const rawDmg = Math.max(1, Math.min(dmgCap, Math.round(dmg)));
     const actualDmg = Math.min(rawDmg, Math.max(0, m.hp));
-    m.hp -= rawDmg;
+    // Subtract actualDmg (capped at remaining hp) so m.hp doesn't go
+    // negative on overkill -- otherwise the broadcast hpPct goes < 0
+    // and any subsequent code reading m.hp sees a nonsensical value.
+    m.hp -= actualDmg;
 
     // Track per-player damage contribution for the kill-time share.
     // dmgByPlayer is created lazily so existing monster snapshots
@@ -2173,8 +2214,16 @@ export class GameRoom {
     const halfRtt = attackerSession.rtt / 2;
     const rewindTicks = Math.min(Math.ceil(halfRtt / this.TICK_RATE), this.LAGCOMP_BUFFER_TICKS);
 
-    const range = payload.range || 40;
-    const arc = payload.arc || 1.2;
+    // Gate: dead / dying / disconnected attackers can't keep firing
+    // PvP hits.  Other handlers (ability_use, eat_request, etc.) all
+    // gate on these flags; PvP was missing the check.
+    if (attackerPs.dying || attackerPs.dead || attackerPs.disconnected) return;
+    // Bound the client-supplied attack geometry so a cheater can't
+    // claim a 99999-pixel range or full-circle arc to hit every player
+    // in the room.  Realistic max: bow range = 200 + amulet bonus,
+    // greatsword arc = PI*0.85 ≈ 2.67 rad.  Cap a bit above those.
+    const range = Math.max(10, Math.min(250, payload.range || 40));
+    const arc = Math.max(0.1, Math.min(Math.PI * 1.1, payload.arc || 1.2));
     const angle = payload.angle || 0;
     // Cap dmgBase to the per-level bound so a cheater can't claim
     // 99999 base damage to one-shot other players.  Server doesn't
@@ -2182,7 +2231,7 @@ export class GameRoom {
     // on attacker level (mirrors the monster_damage cap above).
     const dmgCap = this._maxDmgForLevel(attackerPs.level || 1);
     const dmgBase = Math.max(1, Math.min(dmgCap, payload.dmgBase || 10));
-    const critChance = payload.critChance || 0;
+    const critChance = Math.max(0, Math.min(100, payload.critChance || 0));
 
     // Check all players in room for hits
     for (const [targetId, targetPs] of Object.entries(this.playerState)) {
