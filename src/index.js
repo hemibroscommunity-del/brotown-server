@@ -240,6 +240,22 @@ export class GameRoom {
     return SPEEDS[variantKey];
   }
 
+  // Variant transform thresholds + targets.  Mirrors the
+  // transformAt + transformsTo fields on entries in
+  // src/data/monsterVariants.js.  Returns null for variants that
+  // don't transform.
+  //
+  // Mummy at 50% HP shreds its bandages and becomes a skeleton.  The
+  // worker runs this check in _tickMonsters for every alive variant
+  // monster + emits a monster_transform event; the client plays the
+  // shred animation locally on receipt and updates its archetype.
+  _variantTransform(variantKey) {
+    const T = {
+      mummy: { at: 0.5, to: 'skeleton' },
+    };
+    return T[variantKey] || null;
+  }
+
   // Spawn monsters for a zone
   _spawnZoneMonsters(zoneId) {
     const zone = this._getZoneConfig(zoneId);
@@ -280,6 +296,12 @@ export class GameRoom {
           // override applied), so variant is also the source of truth
           // for movement pace -- not just cosmetics.
           variant: variantKey,
+          // Mid-fight transforms (mummy -> skeleton) mutate m.variant
+          // + m.spd; the respawn path resets to these spawn values so
+          // a re-spawned mummy starts back in mummy form instead of
+          // re-spawning as a skeleton.
+          spawnVariant: variantKey,
+          spawnSpd: finalSpd,
           level: lvl,
           element: zone.element || null,
           hp: Math.ceil(baseHp * a.hpMult),
@@ -349,9 +371,42 @@ export class GameRoom {
             m.y = m.spawnY;
             m.targetId = null;
             m.atkCd = 0;
+            // Revert any in-life variant transform (mummy -> skeleton)
+            // so a respawned monster comes back in its original form
+            // with the original spd.  Stamped at spawn time and
+            // restored here on respawn.
+            if (m.spawnVariant !== undefined) {
+              m.variant = m.spawnVariant;
+              const respawnSpd = m.spawnVariant ? this._variantSpeed(m.spawnVariant) : null;
+              if (respawnSpd != null) m.spd = respawnSpd;
+              else if (m.spawnSpd != null) m.spd = m.spawnSpd;
+            }
             zoneChanged = true;
           }
           continue;
+        }
+
+        // Mid-fight variant transform (currently just mummy -> skeleton
+        // at HP <= 50%).  Server is the source of truth: the worker
+        // detects the threshold, swaps m.variant + m.spd, and emits a
+        // monster_transform event for the client to play the shred
+        // animation locally.  Idempotent -- the m.variant check at the
+        // top guarantees only one transform per monster life (until
+        // respawn resets m.hp and m.variant via re-spawn flow above).
+        if (m.variant) {
+          const tx = this._variantTransform(m.variant);
+          if (tx && m.maxHp > 0 && (m.hp / m.maxHp) <= tx.at) {
+            const fromVariant = m.variant;
+            const toVariant = tx.to;
+            m.variant = toVariant;
+            const newSpd = this._variantSpeed(toVariant);
+            if (newSpd != null) m.spd = newSpd;
+            this.eventBuffer.push({
+              type: 'monster_transform',
+              payload: { id: m.id, zone: zoneId, fromVariant, toVariant },
+            });
+            zoneChanged = true;
+          }
         }
 
         // Find nearest player for aggro
