@@ -430,11 +430,30 @@ export class GameRoom {
         // constructor.  Existing DO instances that were created with
         // a stale value still pick up new tuning on the next tick
         // because they execute the latest deployed bytecode.
+        //
+        // Y-axis scaling for the stop ring: sprites stand taller than
+        // they are wide, so a 45 px Euclidean ring leaves a visible
+        // gap between feet/heads on N-S approaches even though the
+        // E-W approach reads as touching.  Weighting dy by Y_SCALE in
+        // the range test alone (movement still uses true direction)
+        // tightens the effective Y stopping distance to 45 / 1.5 =
+        // 30 px while keeping the X stopping distance at 45 px, so
+        // the monster ends up at the same perceived contact ring
+        // regardless of approach angle.
         const ATTACK_RANGE = 45;
+        const Y_SCALE = 1.5;
         if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
           m.targetId = nearest.id;
-          // Move toward player
-          if (nearestDist > ATTACK_RANGE) {
+          const dxA = nearest.x - m.x;
+          const dyA = nearest.y - m.y;
+          const attackDist = Math.sqrt(dxA * dxA + (dyA * Y_SCALE) * (dyA * Y_SCALE));
+
+          // Move toward player -- but freeze in place while the monster
+          // is in the middle of its post-attack animation window.  The
+          // worker stamps m._attackingUntil after firing a monster_attack
+          // event so the body stops sliding during the swing/lunge sheet.
+          const attackingNow = m._attackingUntil && now < m._attackingUntil;
+          if (attackDist > ATTACK_RANGE && !attackingNow) {
             const dx = nearest.x - m.x;
             const dy = nearest.y - m.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
@@ -446,7 +465,7 @@ export class GameRoom {
           }
 
           // Attack player if in range
-          if (nearestDist <= ATTACK_RANGE && now > m.atkCd) {
+          if (attackDist <= ATTACK_RANGE && now > m.atkCd) {
             // Don't fire damage events while the player is blocking — the
             // client's monster_attack handler also computes block reduction,
             // but that path was producing inconsistent block resolution
@@ -457,6 +476,7 @@ export class GameRoom {
             // queuing while the player blocks.
             if (nearest.blocking) {
               m.atkCd = now + this.MONSTER_ATTACK_CD;
+              m._attackingUntil = now + 400;
               // Block cost: 15 stamina (mirrors client at BroTown.jsx:2663).
               // Server is authoritative for stamina now, so deduct here
               // and echo via player_state so the bar visibly drops.
@@ -469,6 +489,7 @@ export class GameRoom {
               continue;
             }
             m.atkCd = now + this.MONSTER_ATTACK_CD;
+            m._attackingUntil = now + 400;
             // Apply HP damage server-side BEFORE emitting the event so
             // dmgTaken rides on the wire and the client renders the
             // exact number the server applied.  Block already handled
