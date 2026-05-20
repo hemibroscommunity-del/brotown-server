@@ -700,6 +700,128 @@ export class GameRoom {
     if (ws) this._sendPlayerState(ws, session.id);
   }
 
+  // ═══ Cooking recipes (multi-ingredient -> buff or heal) ═══
+  //
+  // Mirrors COOKING_RECIPES in src/data/gameSystems.js.  Client sends
+  // cook_recipe { recipeIdx } when the player triggers a recipe from
+  // either of the two onClick sites (cooking panel + farm food kiosk
+  // -- BroTown.jsx ~18981 / ~29762).  Server validates ingredient
+  // ownership via substring match (same as client), consumes the
+  // ingredients, and applies the buff or heal.
+  //
+  // Buff state is tracked on ps._buffs as { regen: endsAt, resist:
+  // endsAt, damage: endsAt, all: endsAt, hp: endsAt, mana: endsAt }
+  // -- only the buffs that affect server-computed values get applied
+  // server-side (regen in _tickPlayerRegen, resist in _applyDamage,
+  // hp overheal cap in _tickPlayerRegen).  damage / all / spd buffs
+  // affect outgoing damage + move speed which the server doesn't
+  // currently enforce -- those flags are tracked for future use and
+  // emitted in player_state so the client can render correctly.
+  //
+  // Closes the cheat surface for when recipe buffs get wired up:
+  // currently no recipe has buff:'heal' so the heal path is dead
+  // code on the client, but if it gets added later the worker
+  // already handles it safely.
+  _getCookingRecipe(idx) {
+    // Mirror of COOKING_RECIPES from src/data/gameSystems.js.  Keep
+    // in sync when new recipes ship.  The indices must match the
+    // client's array order since the client sends the index.
+    const RECIPES = [
+      { ingredients: { herb_firebloom: 1 },                          buff: 'regen',  power: 0.02, duration: 60, tier: 1 },
+      { ingredients: { herb_rock_vine: 1, herb_cloudpetal: 1 },      buff: 'resist', power: 0.05, duration: 60, tier: 1 },
+      { ingredients: { herb_firebloom: 2 },                          buff: 'damage', power: 0.05, duration: 90, tier: 2 },
+    ];
+    if (!Number.isInteger(idx) || idx < 0 || idx >= RECIPES.length) return null;
+    return RECIPES[idx];
+  }
+
+  // Match-then-consume helper.  The client uses k.includes(type) to
+  // find inventory keys matching an ingredient type (e.g. ingredient
+  // "herb_firebloom" matches any key containing that substring).
+  // Replicate exactly so the server sees the same available count.
+  _consumeIngredient(ps, type, count) {
+    if (!ps.inventory) return false;
+    let remaining = count;
+    // First pass: count availability across matching keys.
+    let total = 0;
+    for (const [k, v] of Object.entries(ps.inventory)) {
+      if (k.includes(type) && v > 0) total += v;
+    }
+    if (total < count) return false;
+    // Second pass: consume from matching keys until satisfied.
+    for (const k of Object.keys(ps.inventory)) {
+      if (remaining <= 0) break;
+      if (!k.includes(type) || ps.inventory[k] <= 0) continue;
+      const take = Math.min(ps.inventory[k], remaining);
+      ps.inventory[k] -= take;
+      remaining -= take;
+      if (ps.inventory[k] <= 0) delete ps.inventory[k];
+    }
+    return true;
+  }
+
+  _handleCookRecipe(session, payload) {
+    if (!session || !session.id) return;
+    const { recipeIdx } = payload || {};
+    const recipe = this._getCookingRecipe(recipeIdx);
+    if (!recipe) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    if (!ps.inventory) ps.inventory = {};
+
+    // First-pass dry-run: confirm ALL ingredients are available
+    // before consuming any (so we don't half-consume on a failure).
+    for (const [type, count] of Object.entries(recipe.ingredients)) {
+      let total = 0;
+      for (const [k, v] of Object.entries(ps.inventory)) {
+        if (k.includes(type) && v > 0) total += v;
+      }
+      if (total < count) return;
+    }
+    // Second pass: actually consume.
+    for (const [type, count] of Object.entries(recipe.ingredients)) {
+      this._consumeIngredient(ps, type, count);
+    }
+
+    // Apply the recipe effect.  Buffs go onto ps._buffs as endsAt
+    // timestamps; heal modifies hp directly.  Duration is seconds
+    // in the recipe table, ms on the wire.
+    if (!ps._buffs) ps._buffs = {};
+    const dur = (recipe.duration || 0) * 1000;
+    const endsAt = Date.now() + dur;
+    if (recipe.buff === 'heal') {
+      if (typeof ps.maxHp !== 'number') ps.maxHp = 100;
+      ps.hp = Math.min(ps.maxHp, (ps.hp || 0) + (recipe.power || 0));
+    } else if (recipe.buff === 'regen') {
+      ps._buffs.regen = endsAt;
+    } else if (recipe.buff === 'resist') {
+      ps._buffs.resist = endsAt;
+    } else if (recipe.buff === 'damage') {
+      ps._buffs.damage = endsAt;
+    } else if (recipe.buff === 'all') {
+      // 'all' buff sets all four sub-buffs.  Mirrors the client at
+      // BroTown.jsx ~29766: damage + spd + hp + mana all extended.
+      ps._buffs.damage = endsAt;
+      ps._buffs.spd = endsAt;
+      ps._buffs.hp = endsAt;
+      ps._buffs.mana = endsAt;
+    }
+
+    // Cooking XP grant -- mirrors addLifeSkillXp on the client.
+    this._addLifeSkillXp(ps, 'cooking', (recipe.tier || 1) * 25);
+
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
+  // Buff-active helpers used in regen + damage paths.  Treat undefined
+  // / 0 / past timestamps as inactive.
+  _buffActive(ps, name) {
+    return !!(ps && ps._buffs && ps._buffs[name] && Date.now() < ps._buffs[name]);
+  }
+
   // ═══ NPC consumables shop (server-authoritative purchase) ═══
   //
   // Client sends shop_purchase { itemId } when the player clicks Buy
@@ -948,6 +1070,10 @@ export class GameRoom {
         fortification: ps.fortification || 0,
         restoration: ps.restoration || 0,
         influence: ps.influence || 0,
+        // Active food buff timers (endsAt timestamps).  Persisted so
+        // they survive reconnect.  Expired entries get pruned lazily
+        // by _buffActive checks; no need to clean on save.
+        _buffs: ps._buffs || {},
       });
     } catch (e) {}
   }
@@ -971,6 +1097,11 @@ export class GameRoom {
           maxStamina: typeof ps.maxStamina === 'number' ? ps.maxStamina : 100,
           mana: typeof ps.mana === 'number' ? ps.mana : (ps.maxMana || 100),
           maxMana: typeof ps.maxMana === 'number' ? ps.maxMana : 100,
+          // Active food buff timers.  Client renders the buff icons +
+          // computes its own multipliers; server's view is authoritative
+          // for the timer (cheater can't extend by writing _dmgBuff =
+          // Infinity locally, since the next player_state clobbers).
+          _buffs: ps._buffs || {},
         },
       }));
     } catch (e) {}
@@ -990,6 +1121,12 @@ export class GameRoom {
     const def = ps.def || 0;
     const r = Math.max(1, Math.round(rawDmg || 0));
     let dmgTaken = isBlock ? 0 : Math.max(1, Math.ceil(r - def * 0.3));
+    // Resist buff (cooking recipe with buff:'resist', power 0.05 = 5%
+    // reduction).  Cooking recipe power values are stored as the
+    // fractional reduction; mirror the client's intent here.
+    if (dmgTaken > 0 && this._buffActive(ps, 'resist')) {
+      dmgTaken = Math.max(1, Math.ceil(dmgTaken * (1 - 0.05)));
+    }
     if (typeof ps.maxHp !== 'number') ps.maxHp = 100;
     if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
     ps.hp = Math.max(0, ps.hp - dmgTaken);
@@ -1235,18 +1372,24 @@ export class GameRoom {
       const oocMana = (now - (ps.lastDamageAt || 0)) > 2000;
       let changed = false;
 
-      // HP regen
-      if (ps.hp < ps.maxHp) {
+      // HP regen.  Cooking recipe regen buff (1.3x mult) and hp buff
+      // (1.25x maxHp overheal cap) layered on top of the existing
+      // restoration + amulet multipliers.
+      const regenBuffActive = this._buffActive(ps, 'regen');
+      const hpBuffActive = this._buffActive(ps, 'hp');
+      const effectiveMaxHp = hpBuffActive ? Math.floor(ps.maxHp * 1.25) : ps.maxHp;
+      if (ps.hp < effectiveMaxHp) {
         let heal;
         if (ooc) {
           const restMult = 1 + (ps.restoration || 0) * 0.001;
           const amuletMult = 1 + (ps.amuletHpRegen || 0) / 100;
-          heal = Math.max(1, Math.ceil(ps.maxHp * 0.001 * restMult * amuletMult)) * 10;
+          const buffMult = regenBuffActive ? 1.3 : 1.0;
+          heal = Math.max(1, Math.ceil(ps.maxHp * 0.001 * restMult * amuletMult * buffMult)) * 10;
         } else {
           heal = Math.max(1, Math.ceil(ps.maxHp * 0.0005)) * 6;
         }
         const beforeHp = ps.hp;
-        ps.hp = Math.min(ps.maxHp, ps.hp + heal);
+        ps.hp = Math.min(effectiveMaxHp, ps.hp + heal);
         if (ps.hp !== beforeHp) changed = true;
       }
 
@@ -1272,11 +1415,13 @@ export class GameRoom {
         }
       }
 
-      // Mana
+      // Mana.  manaBuff (1.3x regen mult) layered on top of restoration.
+      const manaBuffActive = this._buffActive(ps, 'mana');
       if (typeof ps.maxMana === 'number' && typeof ps.mana === 'number' && ps.mana < ps.maxMana) {
         const restMult = 1 + (ps.restoration || 0) * 0.001;
+        const buffMult = manaBuffActive ? 1.3 : 1.0;
         const rate = oocMana ? 0.018 : 0.007;
-        const manaHeal = Math.max(1, Math.ceil(ps.maxMana * rate * restMult));
+        const manaHeal = Math.max(1, Math.ceil(ps.maxMana * rate * restMult * buffMult));
         const beforeMn = ps.mana;
         ps.mana = Math.min(ps.maxMana, ps.mana + manaHeal);
         if (ps.mana !== beforeMn) changed = true;
@@ -1722,19 +1867,53 @@ export class GameRoom {
             this.playerState[msg.id].maxStamina = typeof stored.maxStamina === 'number' ? stored.maxStamina : 100;
             this.playerState[msg.id].mana = typeof stored.mana === 'number' ? stored.mana : 100;
             this.playerState[msg.id].maxMana = typeof stored.maxMana === 'number' ? stored.maxMana : 100;
+            this.playerState[msg.id]._buffs = (stored._buffs && typeof stored._buffs === 'object') ? { ...stored._buffs } : {};
           } else {
-            this.playerState[msg.id].coins = (msg.data && typeof msg.data.rpgCoins === 'number') ? msg.data.rpgCoins : 0;
-            this.playerState[msg.id].inventory = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? { ...msg.data.rpgInventory } : {};
+            // First-connect bootstrap caps.  Stored values (the
+            // branch above) win on reconnect; this branch only runs
+            // when a player has no DO storage entry yet.  Cheaters
+            // who localStorage-tamper before their first ever connect
+            // would otherwise inject huge values that then persist
+            // forever.  Cap each field at "reasonable migrated SP
+            // character" thresholds; legit new players are unaffected
+            // (their values are tiny), legit veteran SP players see
+            // some progression capped (acceptable trade — the user
+            // can raise these caps if they hear complaints).
+            const BOOTSTRAP_LEVEL_CAP = 15;
+            const BOOTSTRAP_XP_CAP = 50000;
+            const BOOTSTRAP_UT2_CAP = 75;
+            const BOOTSTRAP_COINS_CAP = 2000;
+            const BOOTSTRAP_INV_PER_ITEM_CAP = 50;
+            const BOOTSTRAP_INV_KEY_COUNT_CAP = 100;
+
+            const _rawInv = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? msg.data.rpgInventory : {};
+            const _cappedInv = {};
+            let _kc = 0;
+            for (const [k, v] of Object.entries(_rawInv)) {
+              if (_kc >= BOOTSTRAP_INV_KEY_COUNT_CAP) break;
+              const n = Number(v);
+              if (!Number.isFinite(n) || n <= 0) continue;
+              _cappedInv[k] = Math.min(BOOTSTRAP_INV_PER_ITEM_CAP, Math.floor(n));
+              _kc++;
+            }
+
+            this.playerState[msg.id].coins = Math.max(0, Math.min(BOOTSTRAP_COINS_CAP,
+              (msg.data && typeof msg.data.rpgCoins === 'number') ? Math.floor(msg.data.rpgCoins) : 0));
+            this.playerState[msg.id].inventory = _cappedInv;
             this.playerState[msg.id].lifeSkills = (msg.data && msg.data.rpgLifeSkills && typeof msg.data.rpgLifeSkills === 'object') ? { ...msg.data.rpgLifeSkills } : {};
-            this.playerState[msg.id].level = (msg.data && typeof msg.data.rpgLevel === 'number') ? msg.data.rpgLevel : 1;
-            this.playerState[msg.id].xp = (msg.data && typeof msg.data.rpgXp === 'number') ? msg.data.rpgXp : 0;
-            this.playerState[msg.id].unspentT2 = (msg.data && typeof msg.data.rpgUnspentT2 === 'number') ? msg.data.rpgUnspentT2 : 0;
+            this.playerState[msg.id].level = Math.max(1, Math.min(BOOTSTRAP_LEVEL_CAP,
+              (msg.data && typeof msg.data.rpgLevel === 'number') ? Math.floor(msg.data.rpgLevel) : 1));
+            this.playerState[msg.id].xp = Math.max(0, Math.min(BOOTSTRAP_XP_CAP,
+              (msg.data && typeof msg.data.rpgXp === 'number') ? Math.floor(msg.data.rpgXp) : 0));
+            this.playerState[msg.id].unspentT2 = Math.max(0, Math.min(BOOTSTRAP_UT2_CAP,
+              (msg.data && typeof msg.data.rpgUnspentT2 === 'number') ? Math.floor(msg.data.rpgUnspentT2) : 0));
             this.playerState[msg.id].hp = (msg.data && typeof msg.data.rpgHp === 'number') ? msg.data.rpgHp : 100;
             this.playerState[msg.id].maxHp = (msg.data && typeof msg.data.rpgMaxHp === 'number') ? msg.data.rpgMaxHp : 100;
             this.playerState[msg.id].stamina = (msg.data && typeof msg.data.rpgStamina === 'number') ? msg.data.rpgStamina : 100;
             this.playerState[msg.id].maxStamina = (msg.data && typeof msg.data.rpgMaxStamina === 'number') ? msg.data.rpgMaxStamina : 100;
             this.playerState[msg.id].mana = (msg.data && typeof msg.data.rpgMana === 'number') ? msg.data.rpgMana : 100;
             this.playerState[msg.id].maxMana = (msg.data && typeof msg.data.rpgMaxMana === 'number') ? msg.data.rpgMaxMana : 100;
+            this.playerState[msg.id]._buffs = {};
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
           // Session-only equipment-derived values.  Always read from join
@@ -1946,6 +2125,15 @@ export class GameRoom {
         // coins + applies effect (pool restore or inventory grant).
         if (session.id) {
           this._handleShopPurchase(session, msg.payload || msg);
+        }
+        break;
+
+      case 'cook_recipe':
+        // Cooking recipe triggered (multi-ingredient -> buff or heal).
+        // Server validates ingredient ownership, consumes, applies
+        // buff timer to ps._buffs, emits player_state.
+        if (session.id) {
+          this._handleCookRecipe(session, msg.payload || msg);
         }
         break;
 
