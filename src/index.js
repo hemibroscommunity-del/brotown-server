@@ -934,6 +934,20 @@ export class GameRoom {
         maxStamina: typeof ps.maxStamina === 'number' ? ps.maxStamina : 100,
         mana: typeof ps.mana === 'number' ? ps.mana : 100,
         maxMana: typeof ps.maxMana === 'number' ? ps.maxMana : 100,
+        // Raw stats (clamped to per-level cap by _handleStatsUpdate).
+        // Persisted so reconnects don't bootstrap from a freshly-spoofed
+        // join payload.  Cheater would need to re-cheat through the
+        // clamp on every stats_update.
+        power: ps.power || 0,
+        vitality: ps.vitality || 0,
+        endurance: ps.endurance || 0,
+        agility: ps.agility || 0,
+        mind: ps.mind || 0,
+        ferocity: ps.ferocity || 0,
+        elementalMastery: ps.elementalMastery || 0,
+        fortification: ps.fortification || 0,
+        restoration: ps.restoration || 0,
+        influence: ps.influence || 0,
       });
     } catch (e) {}
   }
@@ -987,31 +1001,100 @@ export class GameRoom {
   // every recalcDerived (BroTown.jsx mutation sites listed in the plan).
   // Clamps current hp to the new maxHp so re-derives that shrink the
   // pool don't leave hp > maxHp.
+  // ═══ Stat validation (clamp raw stats to per-level cap) ═══
+  //
+  // Without this, a client could push stats_update { maxHp: 99999 } and
+  // the worker would believe it -- effectively giving themselves an
+  // infinite HP bar.  We close this by tracking the 10 raw stats
+  // (vit / end / mind / power / etc.) ourselves, clamping each to a
+  // per-level cap, and computing maxHp / maxStamina / maxMana from the
+  // formulas in src/data/gameSystems.js (calcMaxHp / Stam / Mana).
+  //
+  // Cap formula: level * 10 + 20.  Each level grants 5 T2 stat points
+  // (one stat could legitimately reach level*5+1 just from T2), plus
+  // T1 use-trained increments, plus amulet stat bonuses.  level*10+20
+  // is ~2x the realistic per-stat ceiling -- generous enough for legit
+  // play (preserves T1 + amulet contributions), tight enough to block
+  // R.vit = 99999 cheats.
+  //
+  // Client's pushed maxHp / maxStamina / maxMana are IGNORED -- the
+  // worker computes its own from the clamped raw stats.
+  _statCap(level) {
+    return Math.max(20, (level || 1) * 10 + 20);
+  }
+
+  _clampStat(value, level) {
+    const cap = this._statCap(level);
+    return Math.max(0, Math.min(cap, Math.floor(value || 0)));
+  }
+
+  _calcMaxHp(level, vitality) {
+    return 100 + ((level || 1) - 1) * 12 + (vitality || 0) * 10;
+  }
+
+  _calcMaxStamina(endurance) {
+    return Math.floor(100 + (endurance || 0) * 3);
+  }
+
+  _calcMaxMana(mind) {
+    return Math.floor(100 + (mind || 0) * 3.5);
+  }
+
+  _recomputeMaxes(ps) {
+    if (!ps) return;
+    const lvl = ps.level || 1;
+    const oldMaxHp = ps.maxHp || 100;
+    const oldMaxStam = ps.maxStamina || 100;
+    const oldMaxMana = ps.maxMana || 100;
+    ps.maxHp = this._calcMaxHp(lvl, ps.vitality || 0);
+    ps.maxStamina = this._calcMaxStamina(ps.endurance || 0);
+    ps.maxMana = this._calcMaxMana(ps.mind || 0);
+    // Clamp current values into the new ranges.
+    if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
+    ps.hp = Math.min(ps.hp, ps.maxHp);
+    if (typeof ps.stamina !== 'number') ps.stamina = ps.maxStamina;
+    ps.stamina = Math.min(ps.stamina, ps.maxStamina);
+    if (typeof ps.mana !== 'number') ps.mana = ps.maxMana;
+    ps.mana = Math.min(ps.mana, ps.maxMana);
+  }
+
   _handleStatsUpdate(session, payload) {
     if (!session || !session.id) return;
     const ps = this.playerState[session.id];
     if (!ps) return;
-    if (typeof payload.maxHp === 'number' && payload.maxHp > 0) {
-      ps.maxHp = Math.max(1, Math.floor(payload.maxHp));
-      if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
-      ps.hp = Math.min(ps.hp, ps.maxHp);
+    const lvl = ps.level || 1;
+    // Raw stats: accept client value, clamp to per-level cap.  Server
+    // computes its own max values from these and ignores any maxHp /
+    // maxStamina / maxMana the client tries to push.
+    const RAW_STATS = ['power', 'vitality', 'endurance', 'agility', 'mind',
+      'ferocity', 'elementalMastery', 'fortification', 'restoration', 'influence'];
+    let statsChanged = false;
+    for (const s of RAW_STATS) {
+      if (typeof payload[s] === 'number') {
+        const clamped = this._clampStat(payload[s], lvl);
+        if (ps[s] !== clamped) {
+          ps[s] = clamped;
+          statsChanged = true;
+        }
+      }
     }
-    if (typeof payload.maxStamina === 'number' && payload.maxStamina > 0) {
-      ps.maxStamina = Math.max(1, Math.floor(payload.maxStamina));
-      if (typeof ps.stamina !== 'number') ps.stamina = ps.maxStamina;
-      ps.stamina = Math.min(ps.stamina, ps.maxStamina);
+    if (statsChanged) {
+      this._recomputeMaxes(ps);
     }
-    if (typeof payload.maxMana === 'number' && payload.maxMana > 0) {
-      ps.maxMana = Math.max(1, Math.floor(payload.maxMana));
-      if (typeof ps.mana !== 'number') ps.mana = ps.maxMana;
-      ps.mana = Math.min(ps.mana, ps.maxMana);
-    }
+    // Session-only equipment-derived values still flow from client.
+    // These don't bypass the maxHp cheat because they don't change
+    // the pool size -- def affects damage reduction, amulet*Regen
+    // affects regen tick rate.  The pool size is server-computed.
     if (typeof payload.def === 'number') ps.def = Math.max(0, payload.def);
     if (typeof payload.amuletHpRegen === 'number') ps.amuletHpRegen = Math.max(0, payload.amuletHpRegen);
     if (typeof payload.amuletStaminaRegen === 'number') ps.amuletStaminaRegen = Math.max(0, payload.amuletStaminaRegen);
-    if (typeof payload.restoration === 'number') ps.restoration = Math.max(0, payload.restoration);
-    if (typeof payload.influence === 'number') ps.influence = Math.max(0, payload.influence);
-    // Persist pool values (the bonus fields are session-only).
+    // restoration + influence are also raw stats above; the duplicate
+    // assignments below are no-ops when those fields are present in
+    // the raw-stat loop, kept for backward compat if the client only
+    // sends these two.
+    if (typeof payload.restoration === 'number' && typeof ps.restoration !== 'number') ps.restoration = Math.max(0, payload.restoration);
+    if (typeof payload.influence === 'number' && typeof ps.influence !== 'number') ps.influence = Math.max(0, payload.influence);
+    // Persist (raw stats + pool values get carried via _saveRpg).
     this._saveRpg(session.id, ps);
     const ws = this._wsBySessionId(session.id);
     if (ws) this._sendPlayerState(ws, session.id);
@@ -1530,7 +1613,10 @@ export class GameRoom {
         const { leveled, levelsGained, newLevel } = this._addCombatXp(recipPs, xpForRecipient);
         // Level-up restores all three pools to max (mirrors the client's
         // existing level-up restore at BroTown.jsx:8973 / 8504 / 9851).
+        // Also recompute maxes since level bumps the maxHp formula
+        // (each level adds 12 base HP).
         if (leveled) {
+          this._recomputeMaxes(recipPs);
           if (typeof recipPs.maxHp === 'number') recipPs.hp = recipPs.maxHp;
           if (typeof recipPs.maxStamina === 'number') recipPs.stamina = recipPs.maxStamina;
           if (typeof recipPs.maxMana === 'number') recipPs.mana = recipPs.maxMana;
@@ -1633,16 +1719,40 @@ export class GameRoom {
             this.playerState[msg.id].maxMana = (msg.data && typeof msg.data.rpgMaxMana === 'number') ? msg.data.rpgMaxMana : 100;
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
-          // Session-only derived stats.  Always read from join — they're
-          // recomputed client-side on every recalcDerived, so the stored
-          // entry doesn't need to carry them.
+          // Session-only equipment-derived values.  Always read from join
+          // — recomputed client-side on every recalcDerived.
           this.playerState[msg.id].def = (msg.data && typeof msg.data.rpgDef === 'number') ? Math.max(0, msg.data.rpgDef) : 0;
           this.playerState[msg.id].amuletHpRegen = (msg.data && typeof msg.data.rpgAmuletHpRegen === 'number') ? Math.max(0, msg.data.rpgAmuletHpRegen) : 0;
           this.playerState[msg.id].amuletStaminaRegen = (msg.data && typeof msg.data.rpgAmuletStaminaRegen === 'number') ? Math.max(0, msg.data.rpgAmuletStaminaRegen) : 0;
-          this.playerState[msg.id].restoration = (msg.data && typeof msg.data.rpgRestoration === 'number') ? Math.max(0, msg.data.rpgRestoration) : 0;
           this.playerState[msg.id].lastDamageAt = 0;
           this.playerState[msg.id].dying = false;
           this.playerState[msg.id].respawnAt = 0;
+
+          // Raw stats: prefer stored (already-clamped) values; bootstrap
+          // from join payload otherwise, clamped to the per-level cap.
+          // Cheater spoofing rpgVitality: 99999 on join gets clamped to
+          // level * 10 + 20 -- bounded forever after, even on reconnect.
+          {
+            const _ps = this.playerState[msg.id];
+            const _lvl = _ps.level || 1;
+            const RAW_STATS = ['power', 'vitality', 'endurance', 'agility', 'mind',
+              'ferocity', 'elementalMastery', 'fortification', 'restoration', 'influence'];
+            const _storedHasStats = stored && typeof stored.vitality === 'number';
+            for (const s of RAW_STATS) {
+              if (_storedHasStats && typeof stored[s] === 'number') {
+                _ps[s] = stored[s];
+              } else {
+                const joinKey = 'rpg' + s.charAt(0).toUpperCase() + s.slice(1);
+                const joinVal = (msg.data && typeof msg.data[joinKey] === 'number') ? msg.data[joinKey] : 0;
+                _ps[s] = this._clampStat(joinVal, _lvl);
+              }
+            }
+            // Server-owned max values: compute from clamped raw stats.
+            // Persisted hp / stamina / mana already loaded above; clamp
+            // them to the recomputed maxes here.
+            this._recomputeMaxes(_ps);
+            this._saveRpg(msg.id, _ps);
+          }
         }
         this.broadcastExcept(ws, { type: 'player_join', id: msg.id, name: msg.name, data: msg.data });
         // Send current state + monsters for player's zone
