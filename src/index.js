@@ -770,6 +770,32 @@ export class GameRoom {
         || slot === 'armor' || slot === 'shield' || slot === 'amulet';
   }
 
+  // Unequip an active equipment slot.  Weapons move to stash (if
+  // room); armor/shield/amulet simply null out since they don't have
+  // a stash today.  Closes the cheat where a client unequips locally
+  // and gets "lost" gear that server still thinks is equipped --
+  // future damage/def math would diverge from client view otherwise.
+  _handleUnequipRequest(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const { slot } = payload || {};
+    if (!this._isValidEquipSlot(slot)) return;
+    const current = ps[slot];
+    if (!current) return;
+    // Weapons go to stash; armor/shield/amulet just null out.
+    if (slot === 'weapon' || slot === 'rangedWeapon' || slot === 'staffWeapon') {
+      if (!Array.isArray(ps.weaponStash)) ps.weaponStash = [];
+      if (ps.weaponStash.length >= this.WEAPON_STASH_CAP) return; // stash full -- reject
+      ps.weaponStash.push(current);
+    }
+    ps[slot] = null;
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   _handleEquipRequest(session, payload) {
     if (!session || !session.id) return;
     const ps = this.playerState[session.id];
@@ -2385,6 +2411,14 @@ export class GameRoom {
         // emits player_state.
         if (session.id) {
           this._handleSellWeapon(session, msg.payload || msg);
+        }
+        break;
+
+      case 'unequip_request':
+        // Unequip an active equipment slot (weapon -> stash,
+        // armor/shield/amulet -> null).
+        if (session.id) {
+          this._handleUnequipRequest(session, msg.payload || msg);
         }
         break;
 
