@@ -219,6 +219,27 @@ export class GameRoom {
     return null;
   }
 
+  // Per-variant gameplay overrides (speed only for now).  Mirrors the
+  // `spd` field on entries in src/data/monsterVariants.js.  Keep in
+  // sync if a variant's speed changes -- the server's AI uses this to
+  // move the monster at the correct pace, so a stale value here means
+  // server-driven movement runs at the wrong speed and clients with
+  // the new variants on screen drift away from the server position.
+  //
+  // skeleton is listed but currently spawns only via the (still
+  // client-side) mummy->skeleton transform.  Once that transform
+  // moves server-side, dropping `clientSideMovement: true` from the
+  // skeleton variant becomes safe; until then, the client keeps
+  // running skeleton AI locally and this entry is informational.
+  _variantSpeed(variantKey) {
+    const SPEEDS = {
+      fireGoblin: 1.5,
+      mummy: 0.4,
+      skeleton: 1.4,
+    };
+    return SPEEDS[variantKey];
+  }
+
   // Spawn monsters for a zone
   _spawnZoneMonsters(zoneId) {
     const zone = this._getZoneConfig(zoneId);
@@ -241,15 +262,24 @@ export class GameRoom {
         const baseDmg = this._monsterStat(12, lvl, 1.045, 1.025, 1.018);
         const baseXp = this._monsterStat(10, lvl, 1.045, 1.025, 1.018);
         const baseGold = this._monsterStat(5, lvl, 1.035, 1.020, 1.015);
+        const variantKey = this._variantForArchInZone(spawn.arch, zoneId);
+        // Variant speed override: if this (arch, zone) maps to a variant
+        // with its own spd (e.g. ember fodder -> fireGoblin spd 1.5),
+        // use it.  This is what makes server-driven AI move the variant
+        // at the right pace, so the client can stop running its own AI
+        // for the variant (was the `clientSideMovement: true` escape
+        // hatch on the client side).
+        const variantSpd = variantKey ? this._variantSpeed(variantKey) : null;
+        const finalSpd = (variantSpd != null) ? variantSpd : (0.5 * a.spdMult);
         monsters.push({
           id: 'sm-' + zoneId + '-' + idx,
           arch: spawn.arch,
           // Variant tag used at kill time for skull / inventory key
-          // resolution.  Server AI still dispatches on `arch` (base
-          // archetype); variant is purely the cosmetic skin the client
-          // renders + the inventory key the kill drops.  Null when no
-          // variant override applies to this (arch, zone) pair.
-          variant: this._variantForArchInZone(spawn.arch, zoneId),
+          // resolution AND for visual / AI dispatch on the client.
+          // Server's AI uses m.spd directly (set above with variant
+          // override applied), so variant is also the source of truth
+          // for movement pace -- not just cosmetics.
+          variant: variantKey,
           level: lvl,
           element: zone.element || null,
           hp: Math.ceil(baseHp * a.hpMult),
@@ -257,7 +287,7 @@ export class GameRoom {
           dmg: Math.ceil(baseDmg * a.dmgMult),
           xp: Math.ceil(baseXp),
           gold: Math.ceil(baseGold),
-          spd: 0.5 * a.spdMult,
+          spd: finalSpd,
           emoji: a.emoji,
           color: a.color,
           x, y, spawnX: x, spawnY: y,
