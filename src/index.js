@@ -555,6 +555,49 @@ export class GameRoom {
     return { leveled: levelsGained > 0, levelsGained, newLevel: ps.level };
   }
 
+  // ═══ T2 stat allocation (server-validated) ═══
+  //
+  // Client sends stat_allocate { stat }; worker validates that
+  // ps.unspentT2 > 0 and the stat name is in the 10-stat list,
+  // decrements unspentT2 by 1, persists, and emits a private
+  // stat_allocated event so the client applies R[stat]++ + recalc.
+  // Closes the "spend more T2 points than you have" cheat -- the
+  // client can no longer mint phantom unspentT2 via localStorage
+  // because the server is the source of truth for the counter.
+  //
+  // What's NOT closed: directly writing R.power = 999 in DevTools.
+  // T1 use-trained increments also still flow client-side.  Closing
+  // those needs server-tracked stat VALUES (with T1 mutations also
+  // server-mediated); a bigger slice -- this one just enforces the
+  // T2 spend gate.
+  _isValidStat(stat) {
+    return stat === 'power' || stat === 'vitality' || stat === 'endurance'
+        || stat === 'agility' || stat === 'mind' || stat === 'ferocity'
+        || stat === 'elementalMastery' || stat === 'fortification'
+        || stat === 'restoration' || stat === 'influence';
+  }
+
+  _handleStatAllocate(session, payload) {
+    if (!session || !session.id) return;
+    const { stat } = payload || {};
+    if (!this._isValidStat(stat)) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if ((ps.unspentT2 || 0) <= 0) return;
+    ps.unspentT2 -= 1;
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) {
+      try {
+        ws.send(JSON.stringify({
+          type: 'stat_allocated',
+          payload: { stat, newUnspentT2: ps.unspentT2 },
+        }));
+      } catch (e) {}
+      this._sendPlayerState(ws, session.id);
+    }
+  }
+
   _handleNodeStrike(session, payload) {
     if (!session || !session.id) return;
     const { id, zone, accuracy } = payload || {};
@@ -1237,6 +1280,15 @@ export class GameRoom {
         // loot_credit back to the picker with their authorized share.
         if (session.id) {
           this._handleLootPickup(session, msg.payload || msg);
+        }
+        break;
+
+      case 'stat_allocate':
+        // Client requests to spend 1 unspentT2 on a named stat.
+        // Server checks ps.unspentT2 > 0 + stat name validity, applies,
+        // and emits stat_allocated so the client mirrors the increment.
+        if (session.id) {
+          this._handleStatAllocate(session, msg.payload || msg);
         }
         break;
 
