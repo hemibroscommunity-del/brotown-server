@@ -338,10 +338,18 @@ export class GameRoom {
         }
 
         // Movement AI
+        //
+        // Stop / attack range is read as a literal here (not from
+        // this.MONSTER_ATTACK_RANGE) so re-tuning takes effect on the
+        // next deploy without needing the DO to restart its
+        // constructor.  Existing DO instances that were created with
+        // a stale value still pick up new tuning on the next tick
+        // because they execute the latest deployed bytecode.
+        const ATTACK_RANGE = 55;
         if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
           m.targetId = nearest.id;
           // Move toward player
-          if (nearestDist > this.MONSTER_ATTACK_RANGE) {
+          if (nearestDist > ATTACK_RANGE) {
             const dx = nearest.x - m.x;
             const dy = nearest.y - m.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
@@ -353,7 +361,7 @@ export class GameRoom {
           }
 
           // Attack player if in range
-          if (nearestDist <= this.MONSTER_ATTACK_RANGE && now > m.atkCd) {
+          if (nearestDist <= ATTACK_RANGE && now > m.atkCd) {
             // Don't fire damage events while the player is blocking — the
             // client's monster_attack handler also computes block reduction,
             // but that path was producing inconsistent block resolution
