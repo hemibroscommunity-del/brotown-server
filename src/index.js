@@ -303,21 +303,36 @@ export class GameRoom {
               continue;
             }
             m.atkCd = now + this.MONSTER_ATTACK_CD;
-            // Push monster_attack event. Include the monster's authoritative
-            // x/y so the client's arc check + out-of-range filter resolve
-            // against the server's view of the world rather than the local
-            // snapshot (which can lag a few ticks).
+            // Apply HP damage server-side BEFORE emitting the event so
+            // dmgTaken rides on the wire and the client renders the
+            // exact number the server applied.  Block already handled
+            // by the early-continue above (server skips the attack
+            // entirely while shielded), but pass !blocking to be
+            // defensive in case the path changes.
+            const targetPs = this.playerState[nearest.id];
+            const dmgTaken = this._applyDamage(targetPs, m.dmg, false);
             this.eventBuffer.push({
               type: 'monster_attack',
               payload: {
                 monsterId: m.id,
                 targetId: nearest.id,
                 dmg: m.dmg,
+                dmgTaken,
                 zone: zoneId,
                 attackerX: m.x,
                 attackerY: m.y,
               }
             });
+            // Echo authoritative hp to the victim + persist.  Death
+            // check feeds the player_died event below.
+            if (targetPs) {
+              this._saveRpg(nearest.id, targetPs);
+              const victimWs = this._wsBySessionId(nearest.id);
+              if (victimWs) this._sendPlayerState(victimWs, nearest.id);
+              if (targetPs.hp <= 0 && !targetPs.dying) {
+                this._handlePlayerDeath(targetPs, nearest.id, 'monster:' + m.id);
+              }
+            }
             // Mark zone dirty so the monster's position is included in the
             // outgoing tick delta. Without this, a stationary monster that
             // attacks a stationary player produces attack events but no
@@ -764,6 +779,8 @@ export class GameRoom {
         level: ps.level || 1,
         xp: ps.xp || 0,
         unspentT2: ps.unspentT2 || 0,
+        hp: typeof ps.hp === 'number' ? ps.hp : 100,
+        maxHp: typeof ps.maxHp === 'number' ? ps.maxHp : 100,
       });
     } catch (e) {}
   }
@@ -781,9 +798,135 @@ export class GameRoom {
           level: ps.level || 1,
           xp: ps.xp || 0,
           unspentT2: ps.unspentT2 || 0,
+          hp: typeof ps.hp === 'number' ? ps.hp : (ps.maxHp || 100),
+          maxHp: typeof ps.maxHp === 'number' ? ps.maxHp : 100,
         },
       }));
     } catch (e) {}
+  }
+
+  // ═══ HP store + damage application (server-authoritative) ═══
+  //
+  // Server owns current hp; clamps to [0, maxHp].  Damage flows through
+  // _applyDamage which mirrors the client formula at BroTown.jsx:2655.
+  // Defense (def) + amulet hpRegen + restoration are session-only fields
+  // pushed by the client via stats_update whenever recalcDerived runs
+  // (equipment / stat-allocation / level change).  Cheater claiming
+  // def=999 makes themselves tanky, but they're a separate cheat
+  // surface from "infinite-heal R.hp = 99999" which this slice closes.
+  _applyDamage(ps, rawDmg, isBlock) {
+    if (!ps) return 0;
+    const def = ps.def || 0;
+    const r = Math.max(1, Math.round(rawDmg || 0));
+    let dmgTaken = isBlock ? 0 : Math.max(1, Math.ceil(r - def * 0.3));
+    if (typeof ps.maxHp !== 'number') ps.maxHp = 100;
+    if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
+    ps.hp = Math.max(0, ps.hp - dmgTaken);
+    ps.lastDamageAt = Date.now();
+    return dmgTaken;
+  }
+
+  // Apply stats_update payload to playerState.  Client sends after
+  // every recalcDerived (BroTown.jsx mutation sites listed in the plan).
+  // Clamps current hp to the new maxHp so re-derives that shrink the
+  // pool don't leave hp > maxHp.
+  _handleStatsUpdate(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (typeof payload.maxHp === 'number' && payload.maxHp > 0) {
+      ps.maxHp = Math.max(1, Math.floor(payload.maxHp));
+      if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
+      ps.hp = Math.min(ps.hp, ps.maxHp);
+    }
+    if (typeof payload.def === 'number') ps.def = Math.max(0, payload.def);
+    if (typeof payload.amuletHpRegen === 'number') ps.amuletHpRegen = Math.max(0, payload.amuletHpRegen);
+    if (typeof payload.restoration === 'number') ps.restoration = Math.max(0, payload.restoration);
+    // Persist hp + maxHp (the bonus fields are session-only).
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
+  // Player death.  Marks the player as dying for the respawn window;
+  // _tickPlayerRespawn flips them back when respawnAt elapses.
+  _handlePlayerDeath(ps, playerId, cause) {
+    if (!ps || ps.dying) return;
+    ps.dying = true;
+    ps.dead = true;
+    ps.respawnAt = Date.now() + 5000;
+    const ws = this._wsBySessionId(playerId);
+    if (ws) {
+      try {
+        ws.send(JSON.stringify({
+          type: 'player_died',
+          payload: { cause: cause || 'unknown', respawnInMs: 5000 },
+        }));
+      } catch (e) {}
+    }
+  }
+
+  // Walk active players for respawn-ready dying players.  Resets hp
+  // to max and emits player_respawned + player_state so the client
+  // teleports to town and clears its death state.  Cheap; runs once
+  // per tick alongside _tickMonsters.
+  _tickPlayerRespawn() {
+    const now = Date.now();
+    for (const [id, ps] of Object.entries(this.playerState)) {
+      if (!ps.dying) continue;
+      if (now < (ps.respawnAt || 0)) continue;
+      ps.hp = ps.maxHp || 100;
+      ps.dying = false;
+      ps.dead = false;
+      ps.respawnAt = 0;
+      ps.z = 'town';
+      ps.lastDamageAt = 0;
+      this._saveRpg(id, ps);
+      const ws = this._wsBySessionId(id);
+      if (ws) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'player_respawned',
+            payload: { zone: 'town' },
+          }));
+        } catch (e) {}
+        this._sendPlayerState(ws, id);
+      }
+    }
+  }
+
+  // HP regen tick.  Runs every REGEN_TICK_INTERVAL ticks of the room
+  // tick loop.  OOC (>5 s since last damage) heals fast w/ restoration
+  // + amulet multipliers; in-combat heals slow.  Only emits player_state
+  // when hp actually changed (every regen interval otherwise spams).
+  //
+  // Rate calibration (see plan file "Regen rate math"):
+  //   OOC:        ceil(maxHp * 0.001 * restMult * amuletMult) * 10
+  //   In-combat:  ceil(maxHp * 0.0005) * 6
+  // Tick interval is 30 server ticks (≈ 670 ms at 45 Hz / TICK_RATE=22).
+  _tickPlayerRegen() {
+    const now = Date.now();
+    for (const [id, ps] of Object.entries(this.playerState)) {
+      if (!ps || ps.dying || ps.dead || ps.disconnected) continue;
+      if (typeof ps.hp !== 'number' || typeof ps.maxHp !== 'number') continue;
+      if (ps.hp >= ps.maxHp) continue;
+      const ooc = (now - (ps.lastDamageAt || 0)) > 5000;
+      let heal;
+      if (ooc) {
+        const restMult = 1 + (ps.restoration || 0) * 0.001;
+        const amuletMult = 1 + (ps.amuletHpRegen || 0) / 100;
+        heal = Math.max(1, Math.ceil(ps.maxHp * 0.001 * restMult * amuletMult)) * 10;
+      } else {
+        heal = Math.max(1, Math.ceil(ps.maxHp * 0.0005)) * 6;
+      }
+      const before = ps.hp;
+      ps.hp = Math.min(ps.maxHp, ps.hp + heal);
+      if (ps.hp !== before) {
+        this._saveRpg(id, ps);
+        const ws = this._wsBySessionId(id);
+        if (ws) this._sendPlayerState(ws, id);
+      }
+    }
   }
 
   // Pile shape (server-side, full):
@@ -1107,6 +1250,12 @@ export class GameRoom {
         const xpForRecipient = Math.round((m.xp || 0) * share);
         if (xpForRecipient <= 0) continue;
         const { leveled, levelsGained, newLevel } = this._addCombatXp(recipPs, xpForRecipient);
+        // Level-up restores HP to max (mirrors the client's existing
+        // line-up restore behavior at BroTown.jsx:8973).  Stamina + mana
+        // get the same treatment in slice 1b.
+        if (leveled && typeof recipPs.maxHp === 'number') {
+          recipPs.hp = recipPs.maxHp;
+        }
         this._saveRpg(rid, recipPs);
         const recipWs = this._wsBySessionId(rid);
         if (recipWs) {
@@ -1184,6 +1333,8 @@ export class GameRoom {
             this.playerState[msg.id].level = stored.level || 1;
             this.playerState[msg.id].xp = stored.xp || 0;
             this.playerState[msg.id].unspentT2 = stored.unspentT2 || 0;
+            this.playerState[msg.id].hp = typeof stored.hp === 'number' ? stored.hp : 100;
+            this.playerState[msg.id].maxHp = typeof stored.maxHp === 'number' ? stored.maxHp : 100;
           } else {
             this.playerState[msg.id].coins = (msg.data && typeof msg.data.rpgCoins === 'number') ? msg.data.rpgCoins : 0;
             this.playerState[msg.id].inventory = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? { ...msg.data.rpgInventory } : {};
@@ -1191,8 +1342,19 @@ export class GameRoom {
             this.playerState[msg.id].level = (msg.data && typeof msg.data.rpgLevel === 'number') ? msg.data.rpgLevel : 1;
             this.playerState[msg.id].xp = (msg.data && typeof msg.data.rpgXp === 'number') ? msg.data.rpgXp : 0;
             this.playerState[msg.id].unspentT2 = (msg.data && typeof msg.data.rpgUnspentT2 === 'number') ? msg.data.rpgUnspentT2 : 0;
+            this.playerState[msg.id].hp = (msg.data && typeof msg.data.rpgHp === 'number') ? msg.data.rpgHp : 100;
+            this.playerState[msg.id].maxHp = (msg.data && typeof msg.data.rpgMaxHp === 'number') ? msg.data.rpgMaxHp : 100;
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
+          // Session-only derived stats (def, amulet hpRegen, restoration).
+          // Always read from join — they're recomputed client-side on every
+          // recalcDerived, so the stored entry doesn't need to carry them.
+          this.playerState[msg.id].def = (msg.data && typeof msg.data.rpgDef === 'number') ? Math.max(0, msg.data.rpgDef) : 0;
+          this.playerState[msg.id].amuletHpRegen = (msg.data && typeof msg.data.rpgAmuletHpRegen === 'number') ? Math.max(0, msg.data.rpgAmuletHpRegen) : 0;
+          this.playerState[msg.id].restoration = (msg.data && typeof msg.data.rpgRestoration === 'number') ? Math.max(0, msg.data.rpgRestoration) : 0;
+          this.playerState[msg.id].lastDamageAt = 0;
+          this.playerState[msg.id].dying = false;
+          this.playerState[msg.id].respawnAt = 0;
         }
         this.broadcastExcept(ws, { type: 'player_join', id: msg.id, name: msg.name, data: msg.data });
         // Send current state + monsters for player's zone
@@ -1336,6 +1498,15 @@ export class GameRoom {
         }
         break;
 
+      case 'stats_update':
+        // Client recalcDerived ran (equipment / stat-alloc / level-up
+        // changed derived stats); push new maxHp + def + regen mods so
+        // the worker's damage math and regen tick use current values.
+        if (session.id) {
+          this._handleStatsUpdate(session, msg.payload || msg);
+        }
+        break;
+
       default:
         if (session.id) {
           msg.from = session.id;
@@ -1397,8 +1568,18 @@ export class GameRoom {
       // Crit roll
       const isCrit = Math.random() * 100 < critChance;
 
-      // Build hit event — defender's client will apply their own defense calc
-      // but the HIT/MISS decision is server-authoritative
+      // Apply HP damage server-side.  Mirrors the client formula at
+      // BroTown.jsx:3029-3035: rawDmg = dmgBase * (crit ? 1.5 : 1) *
+      // (blocked ? 0.25 : 1).  We apply via _applyDamage which handles
+      // the def * 0.3 reduction.  Pass isBlock=false so blocked just
+      // scales the raw dmg (matches client's 0.25× partial-block),
+      // not a full 0-dmg server block.
+      const rawDmg = dmgBase * (isCrit ? 1.5 : 1) * (blocked ? 0.25 : 1);
+      const dmgTaken = this._applyDamage(targetPs, rawDmg, false);
+
+      // Build hit event — server-authoritative hp now mirrors via
+      // player_state below, but dmgTaken in the payload drives the
+      // damage popup so it doesn't have to wait a round-trip.
       const hitEvent = {
         type: 'pvp_hit',
         payload: {
@@ -1406,6 +1587,7 @@ export class GameRoom {
           attackerName: attackerSession.name,
           target: targetId,
           dmgBase: dmgBase,
+          dmgTaken,
           isCrit: isCrit,
           blocked: blocked,
           ts: Date.now(),
@@ -1413,6 +1595,14 @@ export class GameRoom {
         }
       };
       this.eventBuffer.push(hitEvent);
+
+      // Echo authoritative hp + death check.
+      this._saveRpg(targetId, targetPs);
+      const victimWs = this._wsBySessionId(targetId);
+      if (victimWs) this._sendPlayerState(victimWs, targetId);
+      if (targetPs.hp <= 0 && !targetPs.dying) {
+        this._handlePlayerDeath(targetPs, targetId, 'pvp:' + attackerId);
+      }
     }
   }
 
@@ -1434,6 +1624,7 @@ export class GameRoom {
 
   startTickLoop() {
     let pingCounter = 0;
+    let regenCounter = 0;
 
     this.tickInterval = setInterval(() => {
       // §16.12 — Snapshot player states to history buffer
@@ -1460,6 +1651,18 @@ export class GameRoom {
       // Loot pile expiry tick -- piles older than LOOT_EXPIRY_MS get
       // despawned with a broadcast event so clients drop them too.
       this._tickLoot();
+
+      // Player respawn tick — flip dying=>alive when respawnAt elapses.
+      // Cheap; iterates active player entries.
+      this._tickPlayerRespawn();
+
+      // HP regen tick — every 30 server ticks (~670 ms at TICK_RATE=22).
+      // Skip when no one needs healing to avoid wasted iteration.
+      regenCounter++;
+      if (regenCounter >= 30) {
+        regenCounter = 0;
+        this._tickPlayerRegen();
+      }
 
       // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
