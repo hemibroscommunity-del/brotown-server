@@ -1492,6 +1492,20 @@ export class GameRoom {
   }
 
   // Process player damage to a monster
+  // Per-level damage cap.  Loose upper bound for any single hit so a
+  // cheater sending monster_damage { dmg: 99999 } or player_attack
+  // { dmgBase: 99999 } can't one-shot.  Calibrated against the client's
+  // calcWeaponDmg formula in src/data/gameSystems.js:
+  //   base = (weapon.base + power * 0.8) * tierMult
+  // max weapon.base = 48 (greatsword); max tierMult = 5 (shift tier);
+  // power max at level N = N * 5 (all T2 -> power); crit mult ~1.75
+  // plus amulet elemDmg + combo bursts + status amplifiers.
+  // Realistic max DPS hit at level 50 is ~3000-4000; cap of
+  // (level + 5) * 100 gives headroom (5500 at level 50, 600 at level 1).
+  _maxDmgForLevel(level) {
+    return Math.max(100, ((level || 1) + 5) * 100);
+  }
+
   _handleMonsterDamage(session, payload) {
     const { monsterId, zone, dmg, isCrit, element } = payload;
     if (!monsterId || !zone || !dmg) return;
@@ -1503,7 +1517,11 @@ export class GameRoom {
     // Apply damage. Clamp the credited amount to the monster's remaining
     // HP so the overkill on the final blow doesn't inflate the killer's
     // contribution share (GDD §7: DPS = damage / monster_max_hp).
-    const rawDmg = Math.max(1, Math.round(dmg));
+    // Also clamp the incoming value to the per-level cap so a cheater
+    // can't claim 99999 damage to one-shot tough monsters.
+    const attackerPs = this.playerState[session.id];
+    const dmgCap = this._maxDmgForLevel(attackerPs ? attackerPs.level : 1);
+    const rawDmg = Math.max(1, Math.min(dmgCap, Math.round(dmg)));
     const actualDmg = Math.min(rawDmg, Math.max(0, m.hp));
     m.hp -= rawDmg;
 
@@ -1970,7 +1988,12 @@ export class GameRoom {
     const range = payload.range || 40;
     const arc = payload.arc || 1.2;
     const angle = payload.angle || 0;
-    const dmgBase = payload.dmgBase || 10;
+    // Cap dmgBase to the per-level bound so a cheater can't claim
+    // 99999 base damage to one-shot other players.  Server doesn't
+    // own the weapon-tier table yet, so this is a coarse bound based
+    // on attacker level (mirrors the monster_damage cap above).
+    const dmgCap = this._maxDmgForLevel(attackerPs.level || 1);
+    const dmgBase = Math.max(1, Math.min(dmgCap, payload.dmgBase || 10));
     const critChance = payload.critChance || 0;
 
     // Check all players in room for hits
