@@ -51,6 +51,26 @@ export default {
 //  GAME ROOM — One per room, handles WebSocket multiplayer
 // ═══════════════════════════════════════
 
+// Event types the worker emits itself (server -> client).  The default
+// branch of webSocketMessage rebroadcasts unknown msg.type values to
+// every client, so we MUST refuse to rebroadcast any of these from a
+// client -- otherwise a cheater can forge them and grief the room
+// (e.g. forge player_state { hp: 0 } to one-shot everyone).
+const PRIVILEGED_EVENTS = new Set([
+  // Pool / progression mirrors
+  'player_state', 'player_died', 'player_respawned',
+  'combat_credit', 'harvest_credit', 'loot_credit',
+  'stat_allocated', 'ability_rejected',
+  // Combat resolution
+  'monster_attack', 'monster_hit', 'monster_kill', 'pvp_hit',
+  // World state fan-outs
+  'loot_drop', 'loot_claimed', 'loot_despawn',
+  'zone_monsters', 'zone_nodes', 'zone_loot',
+  // Bootstrap + protocol
+  'state_sync', 'tick', 'ping', 'player_count',
+  'player_join', 'player_leave', 'player_update',
+]);
+
 export class GameRoom {
   constructor(state, env) {
     this.state = state;
@@ -1802,6 +1822,23 @@ export class GameRoom {
         break;
 
       default:
+        // Critical security gate: the default branch rebroadcasts the
+        // message to every client in the room via eventBuffer.  Without
+        // a deny-list, a malicious client could forge any server-only
+        // event type (player_state hp:0 to kill everyone, player_died
+        // to grief, combat_credit to fire fake level-up popups, etc.)
+        // and the worker would faithfully rebroadcast it -- every
+        // client's WS switch would then trigger the handler for that
+        // type, which assumes the event came from the server.
+        //
+        // Anything the worker emits itself (player_state, player_died,
+        // _credit fan-outs, monster_* events, loot_* events, tick,
+        // state_sync, etc.) is privileged: never accept it from a
+        // client.  Legitimate client→client broadcasts (chat, emote,
+        // pvp_confirmed, player_shield, player_died_to_monster, etc.)
+        // still flow through here -- they hit the deny-list miss and
+        // get rebroadcast normally.
+        if (PRIVILEGED_EVENTS.has(msg.type)) break;
         if (session.id) {
           msg.from = session.id;
           this.eventBuffer.push(msg);
