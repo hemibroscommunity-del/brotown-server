@@ -1991,18 +1991,44 @@ export class GameRoom {
   }
 
   // Process player damage to a monster
-  // Per-level damage cap.  Loose upper bound for any single hit so a
-  // cheater sending monster_damage { dmg: 99999 } or player_attack
-  // { dmgBase: 99999 } can't one-shot.  Calibrated against the client's
-  // calcWeaponDmg formula in src/data/gameSystems.js:
-  //   base = (weapon.base + power * 0.8) * tierMult
-  // max weapon.base = 48 (greatsword); max tierMult = 5 (shift tier);
-  // power max at level N = N * 5 (all T2 -> power); crit mult ~1.75
-  // plus amulet elemDmg + combo bursts + status amplifiers.
-  // Realistic max DPS hit at level 50 is ~3000-4000; cap of
-  // (level + 5) * 100 gives headroom (5500 at level 50, 600 at level 1).
+  // Weapon-aware damage cap.  Replaces the prior level-only cap
+  // ((level+5)*100) with a tighter bound computed from the attacker's
+  // actual equipped weapon + power + ferocity (all server-tracked
+  // since slices 12 / stat-validation).  Closes the "claim huge
+  // damage to one-shot tough monsters" cheat with much less false-
+  // positive headroom -- a level 1 player with a wood weapon can no
+  // longer claim 600 dmg, only ~350.
+  //
+  // Formula mirrors calcWeaponDmg in src/data/gameSystems.js:
+  //   base = (WEAPON_TYPES[type].base + power * 0.8) * weapon.tierMult
+  // Multiplied by crit cap (1.75 + ferocity * 0.0008) and a generous
+  // 5x "combo + status + amulet + lunge" boost to cover the legit
+  // upper bound without rejecting real hits.
+  _maxWeaponDmg(ps) {
+    if (!ps) return 0;
+    const candidates = [ps.weapon, ps.rangedWeapon, ps.staffWeapon].filter(Boolean);
+    if (candidates.length === 0) return 30; // fists fallback
+    let max = 0;
+    const power = ps.power || 0;
+    for (const w of candidates) {
+      const base = (this._weaponBase(w.type) + power * 0.8) * (w.tierMult || 1);
+      if (base > max) max = base;
+    }
+    return max;
+  }
+
   _maxDmgForLevel(level) {
+    // Legacy name kept for one-call-site compat; the level parameter
+    // is unused now -- the real attacker context comes from playerState.
     return Math.max(100, ((level || 1) + 5) * 100);
+  }
+
+  _maxDmgForAttacker(ps) {
+    if (!ps) return 100;
+    const maxWpn = this._maxWeaponDmg(ps);
+    const critMult = 1.75 + (ps.ferocity || 0) * 0.0008;
+    const comboBoost = 5; // covers combo + status amplifier + amulet elemDmg + lunge mult
+    return Math.max(100, Math.ceil(maxWpn * critMult * comboBoost));
   }
 
   _handleMonsterDamage(session, payload) {
@@ -2019,7 +2045,9 @@ export class GameRoom {
     // Also clamp the incoming value to the per-level cap so a cheater
     // can't claim 99999 damage to one-shot tough monsters.
     const attackerPs = this.playerState[session.id];
-    const dmgCap = this._maxDmgForLevel(attackerPs ? attackerPs.level : 1);
+    // Weapon-aware cap (slice 16): replaces level-only with formula
+    // computed from server-tracked weapon + power + ferocity.
+    const dmgCap = this._maxDmgForAttacker(attackerPs);
     const rawDmg = Math.max(1, Math.min(dmgCap, Math.round(dmg)));
     const actualDmg = Math.min(rawDmg, Math.max(0, m.hp));
     // Subtract actualDmg (capped at remaining hp) so m.hp doesn't go
@@ -2654,11 +2682,10 @@ export class GameRoom {
     const range = Math.max(10, Math.min(250, payload.range || 40));
     const arc = Math.max(0.1, Math.min(Math.PI * 1.1, payload.arc || 1.2));
     const angle = payload.angle || 0;
-    // Cap dmgBase to the per-level bound so a cheater can't claim
-    // 99999 base damage to one-shot other players.  Server doesn't
-    // own the weapon-tier table yet, so this is a coarse bound based
-    // on attacker level (mirrors the monster_damage cap above).
-    const dmgCap = this._maxDmgForLevel(attackerPs.level || 1);
+    // Weapon-aware cap (slice 16) -- mirrors monster_damage cap above.
+    // Server now owns the weapon table so the bound is tighter than
+    // the previous level-only formula.
+    const dmgCap = this._maxDmgForAttacker(attackerPs);
     const dmgBase = Math.max(1, Math.min(dmgCap, payload.dmgBase || 10));
     const critChance = Math.max(0, Math.min(100, payload.critChance || 0));
 
