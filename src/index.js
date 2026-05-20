@@ -1560,6 +1560,11 @@ export class GameRoom {
         _questFlags: ps._questFlags || {},
         _questKills: ps._questKills || {},
         achievementPoints: ps.achievementPoints || 0,
+        // Slice 18 rate-limit history.  Persisted so a cheater
+        // can't reset the 60-second window by reconnecting (which
+        // would otherwise let them claim 'perfect' indefinitely
+        // by cycling the WS connection between batches).
+        _perfectHistory: Array.isArray(ps._perfectHistory) ? ps._perfectHistory : [],
       });
     } catch (e) {}
   }
@@ -2173,12 +2178,6 @@ export class GameRoom {
     return max;
   }
 
-  _maxDmgForLevel(level) {
-    // Legacy name kept for one-call-site compat; the level parameter
-    // is unused now -- the real attacker context comes from playerState.
-    return Math.max(100, ((level || 1) + 5) * 100);
-  }
-
   _maxDmgForAttacker(ps) {
     if (!ps) return 100;
     const maxWpn = this._maxWeaponDmg(ps);
@@ -2424,6 +2423,10 @@ export class GameRoom {
             this.playerState[msg.id]._questFlags = (stored._questFlags && typeof stored._questFlags === 'object') ? { ...stored._questFlags } : {};
             this.playerState[msg.id]._questKills = (stored._questKills && typeof stored._questKills === 'object') ? { ...stored._questKills } : {};
             this.playerState[msg.id].achievementPoints = stored.achievementPoints || 0;
+            // Restore the perfect-claim history so the rate-limit
+            // window survives reconnects.  Stale entries (>60s old)
+            // get pruned on the next _ratedHarvestAccuracy call.
+            this.playerState[msg.id]._perfectHistory = Array.isArray(stored._perfectHistory) ? stored._perfectHistory : [];
           } else {
             // First-connect bootstrap caps.  Stored values (the
             // branch above) win on reconnect; this branch only runs
@@ -2498,11 +2501,28 @@ export class GameRoom {
                 _qKc++;
               }
             }
-            this.playerState[msg.id]._quests = (msg.data && msg.data.rpgQuests && typeof msg.data.rpgQuests === 'object') ? { ...msg.data.rpgQuests } : {};
-            this.playerState[msg.id]._questFlags = (msg.data && msg.data.rpgQuestFlags && typeof msg.data.rpgQuestFlags === 'object') ? { ...msg.data.rpgQuestFlags } : {};
+            // Cap _quests + _questFlags key counts so a cheater
+            // can't fill storage with a 100k-entry map at first
+            // connect.  100 keys is well above the known
+            // QUEST_CHAINS table size (25 quests) + a generous
+            // buffer for flags + future expansion.
+            const _capObjKeys = (src) => {
+              const out = {};
+              if (!src || typeof src !== 'object') return out;
+              let n = 0;
+              for (const [k, v] of Object.entries(src)) {
+                if (n >= 100) break;
+                out[k] = v;
+                n++;
+              }
+              return out;
+            };
+            this.playerState[msg.id]._quests = _capObjKeys((msg.data && msg.data.rpgQuests) || null);
+            this.playerState[msg.id]._questFlags = _capObjKeys((msg.data && msg.data.rpgQuestFlags) || null);
             this.playerState[msg.id]._questKills = _qKclean;
             this.playerState[msg.id].achievementPoints = Math.max(0, Math.min(99999,
               (msg.data && typeof msg.data.rpgAchievementPoints === 'number') ? Math.floor(msg.data.rpgAchievementPoints) : 0));
+            this.playerState[msg.id]._perfectHistory = [];
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
           // Session-only equipment-derived values.  Always read from join
