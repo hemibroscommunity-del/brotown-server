@@ -598,6 +598,40 @@ export class GameRoom {
     }
   }
 
+  // ═══ Cooking (raw fish -> cooked / burnt) ═══
+  //
+  // Client sends cook_request { fishKey, kind } when the cooking
+  // minigame finishes.  Server validates the player actually holds the
+  // raw fish, consumes 1, and applies the outcome:
+  //   kind === 'cooked' -> +1 cooked_<fishKey>, +8 cooking XP
+  //   kind === 'burnt'  -> +1 burnt_dust
+  // Then persists + emits player_state so the client overwrites its
+  // inventory + lifeSkills with the authoritative values.
+  //
+  // Trusts the client on `kind` (the minigame outcome).  Closing that
+  // needs server-side minigame validation -- separate slice.
+  _handleCookRequest(session, payload) {
+    if (!session || !session.id) return;
+    const { fishKey, kind } = payload || {};
+    if (typeof fishKey !== 'string' || !fishKey.startsWith('fish_')) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (!ps.inventory) ps.inventory = {};
+    if ((ps.inventory[fishKey] || 0) <= 0) return;
+    ps.inventory[fishKey] -= 1;
+    if (ps.inventory[fishKey] <= 0) delete ps.inventory[fishKey];
+    if (kind === 'cooked') {
+      const cookedKey = 'cooked_' + fishKey;
+      ps.inventory[cookedKey] = (ps.inventory[cookedKey] || 0) + 1;
+      this._addLifeSkillXp(ps, 'cooking', 8);
+    } else {
+      ps.inventory.burnt_dust = (ps.inventory.burnt_dust || 0) + 1;
+    }
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   _handleNodeStrike(session, payload) {
     if (!session || !session.id) return;
     const { id, zone, accuracy } = payload || {};
@@ -1289,6 +1323,16 @@ export class GameRoom {
         // and emits stat_allocated so the client mirrors the increment.
         if (session.id) {
           this._handleStatAllocate(session, msg.payload || msg);
+        }
+        break;
+
+      case 'cook_request':
+        // Cooking minigame finished; client reports the outcome (kind)
+        // and the raw fish key.  Server validates the player has the
+        // raw fish, applies the consume + cooked/burnt outcome + cooking
+        // XP, and emits player_state.
+        if (session.id) {
+          this._handleCookRequest(session, msg.payload || msg);
         }
         break;
 
