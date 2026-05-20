@@ -810,6 +810,11 @@ export class GameRoom {
     // empty, the stash item moves in and the stash entry becomes
     // null (which we then splice out so stash stays compact).
     const stashItem = ps.weaponStash[stashIdx];
+    // Guard against a stash entry that is null/undefined (could
+    // happen from a corrupted stored blob from before the
+    // splice-on-empty logic existed).  Without this, a cheater
+    // could equip a "null" stash entry to wipe the active slot.
+    if (!stashItem) return;
     const activeItem = ps[slot] || null;
     ps[slot] = stashItem;
     if (activeItem) {
@@ -1275,7 +1280,7 @@ export class GameRoom {
           armor: ps.armor || null,
           shield: ps.shield || null,
           amulet: ps.amulet || null,
-          weaponStash: Array.isArray(ps.weaponStash) ? ps.weaponStash : [],
+          weaponStash: Array.isArray(ps.weaponStash) ? ps.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [],
         },
       }));
     } catch (e) {}
@@ -2244,15 +2249,20 @@ export class GameRoom {
           }
           ps.lastMoveAt = _now;
 
+          // Position + velocity + flags update only on accept.  On
+          // reject, ps.z is still updated for zone-change bypasses
+          // (those always set accept=true); for non-zone-change
+          // rejections, we drop EVERYTHING so a cheater can't flip
+          // blocking/dodging/dead while teleporting.
           if (accept) {
             ps.x = msg.x; ps.y = msg.y;
+            ps.d = msg.d || ps.d; ps.z = newZone;
+            ps.vx = msg.vx || 0; ps.vy = msg.vy || 0;
+            if (msg.dodging !== undefined) ps.dodging = !!msg.dodging;
+            if (msg.blocking !== undefined) ps.blocking = !!msg.blocking;
+            if (msg.dead !== undefined) ps.dead = !!msg.dead;
+            this.dirtyPlayers.add(session.id);
           }
-          ps.d = msg.d || ps.d; ps.z = newZone;
-          ps.vx = msg.vx || 0; ps.vy = msg.vy || 0;
-          if (msg.dodging !== undefined) ps.dodging = !!msg.dodging;
-          if (msg.blocking !== undefined) ps.blocking = !!msg.blocking;
-          if (msg.dead !== undefined) ps.dead = !!msg.dead;
-          this.dirtyPlayers.add(session.id);
 
           // Zone change — send monster + gather node state for new zone
           if (ps.z !== oldZone && ps.z !== 'town' && ps.z !== 'farm_home') {
