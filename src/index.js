@@ -107,7 +107,14 @@ export class GameRoom {
     this.dirtyMonsters = new Set(); // zoneIds with changed monsters
     this.RESPAWN_TIME = 15000; // 15s respawn
     this.MONSTER_AGGRO_RANGE = 120; // pixels
-    this.MONSTER_ATTACK_RANGE = 25;
+    /* Monster stop + attack distance.  Bumped 25 -> 40 so monsters
+       halt about ~15 px away from the player instead of right on top,
+       leaving room for the player to face the threat and raise their
+       directional shield before the swing connects.  Same constant
+       gates both "stop advancing" (line ~262) and "attack if in range"
+       (line ~292) so they stay paired -- monster halts and attacks
+       at the same ring. */
+    this.MONSTER_ATTACK_RANGE = 40;
     this.MONSTER_ATTACK_CD = 1500; // ms
     this.TILE = 32;
 
