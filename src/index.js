@@ -192,6 +192,26 @@ export class GameRoom {
     return ZONES[zoneId] || null;
   }
 
+  // Per-zone monster variant overrides.  Mirrors ZONE_VARIANT_MAP in
+  // src/data/monsterVariants.js.  Server AI runs against the BASE
+  // archetype (fodder/brute/etc.) so this only affects the variant
+  // name used for skull / inventory-key resolution on kill --
+  // without it, killing a flame-zone fodder (rendered as a fire
+  // goblin on the client) drops 'slime-remnants' instead of
+  // 'fire-goblin-remnants'.  Keep in sync if new variants ship.
+  _variantForArchInZone(arch, zoneId) {
+    const MAP = {
+      ember: { fodder: 'fireGoblin' },
+      sky: {
+        fodder: 'mummy', stalker: 'mummy', hexer: 'mummy',
+        volatile: 'mummy', brute: 'mummy', swarm: 'mummy', sentinel: 'mummy',
+      },
+    };
+    const zm = MAP[zoneId];
+    if (zm && zm[arch]) return zm[arch];
+    return null;
+  }
+
   // Spawn monsters for a zone
   _spawnZoneMonsters(zoneId) {
     const zone = this._getZoneConfig(zoneId);
@@ -217,6 +237,12 @@ export class GameRoom {
         monsters.push({
           id: 'sm-' + zoneId + '-' + idx,
           arch: spawn.arch,
+          // Variant tag used at kill time for skull / inventory key
+          // resolution.  Server AI still dispatches on `arch` (base
+          // archetype); variant is purely the cosmetic skin the client
+          // renders + the inventory key the kill drops.  Null when no
+          // variant override applies to this (arch, zone) pair.
+          variant: this._variantForArchInZone(spawn.arch, zoneId),
           level: lvl,
           element: zone.element || null,
           hp: Math.ceil(baseHp * a.hpMult),
@@ -1485,6 +1511,10 @@ export class GameRoom {
   _invKeyForSkull(skull) {
     if (skull === 'fodder') return 'slime-remnants';
     if (skull === 'fireGoblin') return 'fire-goblin-remnants';
+    // Mummy and skeleton both stack into 'skeleton-remnants' (matches
+    // the client's local-pickup mapping at BroTown.jsx ~9071).  Skeleton
+    // is the runtime transform target of mummy; both map the same way.
+    if (skull === 'mummy' || skull === 'skeleton') return 'skeleton-remnants';
     return skull;
   }
 
@@ -1980,7 +2010,12 @@ export class GameRoom {
   //     claimedBy: {pid: true} }
   _spawnLootForKill(zone, monster, killerSessionId, recipients, shares) {
     const lootId = 'mk-' + monster.id;
-    const skull = this._isRemnantSkullArch(monster.arch) ? monster.arch : null;
+    // Use the variant if set (e.g. ember fodder -> fireGoblin, sky
+    // fodder -> mummy) so _invKeyForSkull produces the correct
+    // inventory key on pickup.  Falls back to the base archetype
+    // for monsters with no variant override.
+    const skullSource = monster.variant || monster.arch;
+    const skull = this._isRemnantSkullArch(skullSource) ? skullSource : null;
     const shard = this._rollShardForKill(zone);
     if (!skull && (!recipients || recipients.length === 0) && monster.gold <= 0 && !shard) {
       // Nothing of value would drop -- skip the pile entirely.
@@ -2682,33 +2717,53 @@ export class GameRoom {
             this.dirtyPlayers.add(session.id);
           }
 
-          // Zone change — send monster + gather node state for new zone
-          if (ps.z !== oldZone && ps.z !== 'town' && ps.z !== 'farm_home') {
-            const newMonsters = this._ensureZoneMonsters(ps.z);
-            ws.send(JSON.stringify({
-              type: 'zone_monsters',
-              zone: ps.z,
-              monsters: newMonsters.map(m => ({
-                id: m.id, arch: m.arch, level: m.level, element: m.element,
-                x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp, dmg: m.dmg,
-                xp: m.xp, gold: m.gold, spd: m.spd, emoji: m.emoji, color: m.color,
-                alive: m.alive,
-              })),
-            }));
-            const newNodes = this._ensureZoneNodes(ps.z);
-            ws.send(JSON.stringify({
-              type: 'zone_nodes',
-              zone: ps.z,
-              nodes: newNodes.map(n => ({
-                id: n.id, nodeType: n.nodeType, x: n.x, y: n.y,
-                tierLvl: n.tierLvl, alive: n.alive, respawnAt: n.respawnAt,
-              })),
-            }));
-            ws.send(JSON.stringify({
-              type: 'zone_loot',
-              zone: ps.z,
-              loot: this._zoneLootForWire(ps.z),
-            }));
+          // Zone change handling.
+          if (ps.z !== oldZone) {
+            if (ps.z !== 'town' && ps.z !== 'farm_home') {
+              // Combat zone -- send the new zone's monster + gather +
+              // loot state so the client can render them.
+              const newMonsters = this._ensureZoneMonsters(ps.z);
+              ws.send(JSON.stringify({
+                type: 'zone_monsters',
+                zone: ps.z,
+                monsters: newMonsters.map(m => ({
+                  id: m.id, arch: m.arch, level: m.level, element: m.element,
+                  x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp, dmg: m.dmg,
+                  xp: m.xp, gold: m.gold, spd: m.spd, emoji: m.emoji, color: m.color,
+                  alive: m.alive,
+                })),
+              }));
+              const newNodes = this._ensureZoneNodes(ps.z);
+              ws.send(JSON.stringify({
+                type: 'zone_nodes',
+                zone: ps.z,
+                nodes: newNodes.map(n => ({
+                  id: n.id, nodeType: n.nodeType, x: n.x, y: n.y,
+                  tierLvl: n.tierLvl, alive: n.alive, respawnAt: n.respawnAt,
+                })),
+              }));
+              ws.send(JSON.stringify({
+                type: 'zone_loot',
+                zone: ps.z,
+                loot: this._zoneLootForWire(ps.z),
+              }));
+            } else {
+              // Safe zone (town / farm_home) -- explicitly send empty
+              // state for all three so the client clears stale entries
+              // from the previous combat zone.  Without this, ember
+              // monsters / nodes / loot piles persist in the client's
+              // S.monsters / S.gatherNodes / S.groundLoot after the
+              // player crosses to town, and render on the town map.
+              ws.send(JSON.stringify({
+                type: 'zone_monsters', zone: ps.z, monsters: [],
+              }));
+              ws.send(JSON.stringify({
+                type: 'zone_nodes', zone: ps.z, nodes: [],
+              }));
+              ws.send(JSON.stringify({
+                type: 'zone_loot', zone: ps.z, loot: [],
+              }));
+            }
           }
         }
         break;
