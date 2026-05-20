@@ -518,6 +518,43 @@ export class GameRoom {
     return 'shard_' + zoneId;
   }
 
+  // ═══ Combat XP + level (server-authoritative) ═══
+  //
+  // Mirrors xpRequired() in src/data/gameSystems.js so the worker
+  // computes the same level-up threshold the client used to.  Three
+  // segments (lvl <= 30, <= 65, <= 100) plus a post-100 prestige
+  // ramp -- keep this byte-identical with the client if you ever
+  // tune the curve.
+  _xpRequiredForLevel(level) {
+    const L = level || 1;
+    if (L <= 30) return Math.ceil(500 * Math.pow(1.10, L - 1));
+    const at30 = Math.ceil(500 * Math.pow(1.10, 29));
+    if (L <= 65) return Math.ceil(at30 * Math.pow(1.07, L - 30));
+    const at65 = Math.ceil(at30 * Math.pow(1.07, 35));
+    if (L <= 100) return Math.ceil(at65 * Math.pow(1.04, L - 65));
+    const at100 = Math.ceil(at65 * Math.pow(1.04, 35));
+    return Math.ceil(at100 * Math.pow(1.08, L - 100));
+  }
+
+  // Apply combat XP, level-up loop, +5 unspentT2 per level (GDD §1.4).
+  // Returns { leveled, levelsGained, newLevel } so the caller can
+  // emit a combat_credit event for the picker's level-up popup +
+  // SFX.  Mutates ps.level, ps.xp, ps.unspentT2 in place.
+  _addCombatXp(ps, xpAmt) {
+    if (!ps) return { leveled: false, levelsGained: 0, newLevel: 1 };
+    ps.level = ps.level || 1;
+    ps.xp = (ps.xp || 0) + (xpAmt || 0);
+    ps.unspentT2 = ps.unspentT2 || 0;
+    let levelsGained = 0;
+    while (ps.xp >= this._xpRequiredForLevel(ps.level)) {
+      ps.xp -= this._xpRequiredForLevel(ps.level);
+      ps.level += 1;
+      ps.unspentT2 += 5;
+      levelsGained += 1;
+    }
+    return { leveled: levelsGained > 0, levelsGained, newLevel: ps.level };
+  }
+
   _handleNodeStrike(session, payload) {
     if (!session || !session.id) return;
     const { id, zone, accuracy } = payload || {};
@@ -647,6 +684,9 @@ export class GameRoom {
         coins: ps.coins || 0,
         inventory: ps.inventory || {},
         lifeSkills: ps.lifeSkills || {},
+        level: ps.level || 1,
+        xp: ps.xp || 0,
+        unspentT2: ps.unspentT2 || 0,
       });
     } catch (e) {}
   }
@@ -661,6 +701,9 @@ export class GameRoom {
           coins: ps.coins || 0,
           inventory: ps.inventory || {},
           lifeSkills: ps.lifeSkills || {},
+          level: ps.level || 1,
+          xp: ps.xp || 0,
+          unspentT2: ps.unspentT2 || 0,
         },
       }));
     } catch (e) {}
@@ -973,6 +1016,40 @@ export class GameRoom {
         });
       }
 
+      // Server-authoritative combat XP.  For every contribution-weighted
+      // recipient (xpRecipients above), apply their share of m.xp to
+      // playerState[id].xp + run the level-up loop.  Emit a private
+      // combat_credit event so the picker's "+N XP" popup + level-up
+      // SFX fire on receive; player_state then carries the new
+      // authoritative totals so the client overwrites R.xp / R.level /
+      // R.unspentT2.
+      for (const rid of xpRecipients) {
+        const recipPs = this.playerState[rid];
+        if (!recipPs) continue;
+        const share = shares[rid] || 0;
+        const xpForRecipient = Math.round((m.xp || 0) * share);
+        if (xpForRecipient <= 0) continue;
+        const { leveled, levelsGained, newLevel } = this._addCombatXp(recipPs, xpForRecipient);
+        this._saveRpg(rid, recipPs);
+        const recipWs = this._wsBySessionId(rid);
+        if (recipWs) {
+          try {
+            recipWs.send(JSON.stringify({
+              type: 'combat_credit',
+              payload: {
+                monsterId: m.id,
+                zone,
+                xpAmt: xpForRecipient,
+                leveled,
+                levelsGained,
+                newLevel,
+              },
+            }));
+          } catch (e) {}
+          this._sendPlayerState(recipWs, rid);
+        }
+      }
+
       // Clear contribution tracking for the next life of this monster.
       m.dmgByPlayer = {};
     }
@@ -1027,10 +1104,16 @@ export class GameRoom {
             this.playerState[msg.id].coins = stored.coins || 0;
             this.playerState[msg.id].inventory = stored.inventory || {};
             this.playerState[msg.id].lifeSkills = stored.lifeSkills || {};
+            this.playerState[msg.id].level = stored.level || 1;
+            this.playerState[msg.id].xp = stored.xp || 0;
+            this.playerState[msg.id].unspentT2 = stored.unspentT2 || 0;
           } else {
             this.playerState[msg.id].coins = (msg.data && typeof msg.data.rpgCoins === 'number') ? msg.data.rpgCoins : 0;
             this.playerState[msg.id].inventory = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? { ...msg.data.rpgInventory } : {};
             this.playerState[msg.id].lifeSkills = (msg.data && msg.data.rpgLifeSkills && typeof msg.data.rpgLifeSkills === 'object') ? { ...msg.data.rpgLifeSkills } : {};
+            this.playerState[msg.id].level = (msg.data && typeof msg.data.rpgLevel === 'number') ? msg.data.rpgLevel : 1;
+            this.playerState[msg.id].xp = (msg.data && typeof msg.data.rpgXp === 'number') ? msg.data.rpgXp : 0;
+            this.playerState[msg.id].unspentT2 = (msg.data && typeof msg.data.rpgUnspentT2 === 'number') ? msg.data.rpgUnspentT2 : 0;
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
         }
