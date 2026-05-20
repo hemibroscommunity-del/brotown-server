@@ -680,6 +680,68 @@ export class GameRoom {
     if (ws) this._sendPlayerState(ws, session.id);
   }
 
+  // ═══ NPC consumables shop (server-authoritative purchase) ═══
+  //
+  // Client sends shop_purchase { itemId } when the player clicks Buy
+  // on the NPC vendor.  Server mirrors the 5-item table (see client at
+  // BroTown.jsx ~17905), validates ps.coins >= discounted cost (where
+  // discount = min(0.20, ps.influence * 0.002) per §2.6), deducts coins,
+  // applies the effect to the appropriate playerState field, persists,
+  // and emits player_state.
+  //
+  // Closes the "buy infinite potions" + "buy without spending coins"
+  // cheats: server is the only writer for coins/inventory/pools after
+  // a purchase.  The dmgBuff effect is transient client-only (_dmgBuff
+  // timer); no server tracking needed for that one.
+  _getShopItem(itemId) {
+    const TABLE = {
+      cookedMinnow:  { cost: 8,  effect: 'healFish', power: 23 },
+      basicTrap:     { cost: 20, effect: 'trap' },
+      staminaSalts:  { cost: 12, effect: 'stamina', power: 60 },
+      manaShard:     { cost: 18, effect: 'mana', power: 40 },
+      whetstone:     { cost: 35, effect: 'dmgBuff' },
+    };
+    return TABLE[itemId] || null;
+  }
+
+  _handleShopPurchase(session, payload) {
+    if (!session || !session.id) return;
+    const { itemId } = payload || {};
+    if (typeof itemId !== 'string') return;
+    const item = this._getShopItem(itemId);
+    if (!item) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    // §2.6 Influence discount — 0.2% per point, max 20%.
+    const discount = Math.min(0.20, (ps.influence || 0) * 0.002);
+    const finalCost = Math.max(1, Math.floor(item.cost * (1 - discount)));
+    if ((ps.coins || 0) < finalCost) return;
+    ps.coins -= finalCost;
+    // Apply effect.  Pool restores clamp to max; trap grants inventory;
+    // dmgBuff is transient client-only (server doesn't track buff timers).
+    if (item.effect === 'healFish') {
+      if (typeof ps.maxHp !== 'number') ps.maxHp = 100;
+      if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
+      ps.hp = Math.min(ps.maxHp, ps.hp + (item.power || 23));
+    } else if (item.effect === 'stamina') {
+      if (typeof ps.maxStamina !== 'number') ps.maxStamina = 100;
+      if (typeof ps.stamina !== 'number') ps.stamina = ps.maxStamina;
+      ps.stamina = Math.min(ps.maxStamina, ps.stamina + (item.power || 60));
+    } else if (item.effect === 'mana') {
+      if (typeof ps.maxMana !== 'number') ps.maxMana = 100;
+      if (typeof ps.mana !== 'number') ps.mana = ps.maxMana;
+      ps.mana = Math.min(ps.maxMana, ps.mana + (item.power || 40));
+    } else if (item.effect === 'trap') {
+      if (!ps.inventory) ps.inventory = {};
+      ps.inventory.basic_trap = (ps.inventory.basic_trap || 0) + 1;
+    }
+    // dmgBuff: no-op server-side (transient buff state).
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   // ═══ Cooking (raw fish -> cooked / burnt) ═══
   //
   // Client sends cook_request { fishKey, kind } when the cooking
@@ -928,6 +990,7 @@ export class GameRoom {
     if (typeof payload.amuletHpRegen === 'number') ps.amuletHpRegen = Math.max(0, payload.amuletHpRegen);
     if (typeof payload.amuletStaminaRegen === 'number') ps.amuletStaminaRegen = Math.max(0, payload.amuletStaminaRegen);
     if (typeof payload.restoration === 'number') ps.restoration = Math.max(0, payload.restoration);
+    if (typeof payload.influence === 'number') ps.influence = Math.max(0, payload.influence);
     // Persist pool values (the bonus fields are session-only).
     this._saveRpg(session.id, ps);
     const ws = this._wsBySessionId(session.id);
@@ -1727,6 +1790,14 @@ export class GameRoom {
         // player_state.
         if (session.id) {
           this._handleEatRequest(session, msg.payload || msg);
+        }
+        break;
+
+      case 'shop_purchase':
+        // Player clicked Buy on the NPC vendor.  Server validates
+        // coins + applies effect (pool restore or inventory grant).
+        if (session.id) {
+          this._handleShopPurchase(session, msg.payload || msg);
         }
         break;
 
