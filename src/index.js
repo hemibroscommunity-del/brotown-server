@@ -114,7 +114,7 @@ export class GameRoom {
        constant gates both "stop advancing" (line ~262) and "attack
        if in range" (line ~292) so they stay paired -- monster halts
        and attacks at the same ring. */
-    this.MONSTER_ATTACK_RANGE = 55;
+    this.MONSTER_ATTACK_RANGE = 45;
     this.MONSTER_ATTACK_CD = 1500; // ms
     this.TILE = 32;
 
@@ -430,7 +430,7 @@ export class GameRoom {
         // constructor.  Existing DO instances that were created with
         // a stale value still pick up new tuning on the next tick
         // because they execute the latest deployed bytecode.
-        const ATTACK_RANGE = 55;
+        const ATTACK_RANGE = 45;
         if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
           m.targetId = nearest.id;
           // Move toward player
