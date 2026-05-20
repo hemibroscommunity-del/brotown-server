@@ -84,6 +84,7 @@ export class GameRoom {
     this.TICK_RATE = 22; // 45Hz (22ms)
     this.MAX_PLAYERS = 50;
     this.EVENTS_PER_TICK_CAP = 500;
+    this.WEAPON_STASH_CAP = 8; // mirrors WEAPON_STASH_MAX in src/data/gameSystems.js
 
     // §16.12 — PvP Lag Compensation
     this.stateHistory = {};
@@ -704,6 +705,66 @@ export class GameRoom {
     if (ws) this._sendPlayerState(ws, session.id);
   }
 
+  // ═══ Equipment store (opaque blobs + equip_request) ═══
+  //
+  // Slots tracked on playerState:
+  //   weapon         -- active melee weapon
+  //   rangedWeapon   -- active ranged weapon (bow / crossbow)
+  //   staffWeapon    -- active staff weapon
+  //   activeSlot     -- 'melee' | 'ranged' | 'staff' (which is "in hand")
+  //   armor          -- equipped armor
+  //   shield         -- equipped shield (with off-hand)
+  //   amulet         -- equipped amulet
+  //   weaponStash    -- array of stored weapons (max WEAPON_STASH_MAX = 8)
+  //
+  // This slice stores equipment as opaque objects the client provided.
+  // Server doesn't yet compute weapon stats (base damage, tier mult,
+  // etc.) -- that mirror lands in the "server-computed damage" slice.
+  // The cheat closure here is "is this a fake item?": with equipment
+  // server-tracked, future slices can validate that a sold weapon
+  // actually exists in the player's stash / active slot before
+  // crediting coins or pushing to the marketplace.
+  //
+  // equip_request swaps a stash entry with an active equipment slot.
+  // Server validates stashIdx is in range + slot name is known.
+  // (WEAPON_STASH_CAP set in constructor; mirrors WEAPON_STASH_MAX
+  // in src/data/gameSystems.js.)
+  _isValidEquipSlot(slot) {
+    return slot === 'weapon' || slot === 'rangedWeapon' || slot === 'staffWeapon'
+        || slot === 'armor' || slot === 'shield' || slot === 'amulet';
+  }
+
+  _handleEquipRequest(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const { stashIdx, slot } = payload || {};
+    if (!this._isValidEquipSlot(slot)) return;
+    if (!Number.isInteger(stashIdx) || stashIdx < 0) return;
+    if (!Array.isArray(ps.weaponStash)) ps.weaponStash = [];
+    if (stashIdx >= ps.weaponStash.length) return;
+    // Swap stash entry with current active slot.  If active slot
+    // empty, the stash item moves in and the stash entry becomes
+    // null (which we then splice out so stash stays compact).
+    const stashItem = ps.weaponStash[stashIdx];
+    const activeItem = ps[slot] || null;
+    ps[slot] = stashItem;
+    if (activeItem) {
+      ps.weaponStash[stashIdx] = activeItem;
+    } else {
+      ps.weaponStash.splice(stashIdx, 1);
+    }
+    // Sanity cap so stash can't grow past the client-side limit even
+    // if a cheater somehow inflates it via prior bootstrap.
+    if (ps.weaponStash.length > this.WEAPON_STASH_CAP) {
+      ps.weaponStash.length = this.WEAPON_STASH_CAP;
+    }
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   // ═══ Cooking recipes (multi-ingredient -> buff or heal) ═══
   //
   // Mirrors COOKING_RECIPES in src/data/gameSystems.js.  Client sends
@@ -1103,6 +1164,18 @@ export class GameRoom {
         // they survive reconnect.  Expired entries get pruned lazily
         // by _buffActive checks; no need to clean on save.
         _buffs: ps._buffs || {},
+        // Equipment slots.  Stored as opaque objects the client
+        // provided; server doesn't compute weapon stats from these
+        // yet (separate slice).  Validating ownership on sell /
+        // marketplace flows is the immediate cheat closure.
+        weapon: ps.weapon || null,
+        rangedWeapon: ps.rangedWeapon || null,
+        staffWeapon: ps.staffWeapon || null,
+        activeSlot: ps.activeSlot || 'melee',
+        armor: ps.armor || null,
+        shield: ps.shield || null,
+        amulet: ps.amulet || null,
+        weaponStash: Array.isArray(ps.weaponStash) ? ps.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [],
       });
     } catch (e) {}
   }
@@ -1131,6 +1204,16 @@ export class GameRoom {
           // for the timer (cheater can't extend by writing _dmgBuff =
           // Infinity locally, since the next player_state clobbers).
           _buffs: ps._buffs || {},
+          // Equipment slots.  Worker is authoritative for ownership;
+          // client renders from these on player_state arrival.
+          weapon: ps.weapon || null,
+          rangedWeapon: ps.rangedWeapon || null,
+          staffWeapon: ps.staffWeapon || null,
+          activeSlot: ps.activeSlot || 'melee',
+          armor: ps.armor || null,
+          shield: ps.shield || null,
+          amulet: ps.amulet || null,
+          weaponStash: Array.isArray(ps.weaponStash) ? ps.weaponStash : [],
         },
       }));
     } catch (e) {}
@@ -1909,6 +1992,17 @@ export class GameRoom {
             this.playerState[msg.id].mana = typeof stored.mana === 'number' ? stored.mana : 100;
             this.playerState[msg.id].maxMana = typeof stored.maxMana === 'number' ? stored.maxMana : 100;
             this.playerState[msg.id]._buffs = (stored._buffs && typeof stored._buffs === 'object') ? { ...stored._buffs } : {};
+            // Equipment from stored.  Server doesn't validate the
+            // shape of these blobs -- just preserves what was last
+            // persisted.  Stash truncated to cap.
+            this.playerState[msg.id].weapon = stored.weapon || null;
+            this.playerState[msg.id].rangedWeapon = stored.rangedWeapon || null;
+            this.playerState[msg.id].staffWeapon = stored.staffWeapon || null;
+            this.playerState[msg.id].activeSlot = stored.activeSlot || 'melee';
+            this.playerState[msg.id].armor = stored.armor || null;
+            this.playerState[msg.id].shield = stored.shield || null;
+            this.playerState[msg.id].amulet = stored.amulet || null;
+            this.playerState[msg.id].weaponStash = Array.isArray(stored.weaponStash) ? stored.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [];
           } else {
             // First-connect bootstrap caps.  Stored values (the
             // branch above) win on reconnect; this branch only runs
@@ -1955,6 +2049,19 @@ export class GameRoom {
             this.playerState[msg.id].mana = (msg.data && typeof msg.data.rpgMana === 'number') ? msg.data.rpgMana : 100;
             this.playerState[msg.id].maxMana = (msg.data && typeof msg.data.rpgMaxMana === 'number') ? msg.data.rpgMaxMana : 100;
             this.playerState[msg.id]._buffs = {};
+            // Equipment bootstrap.  No first-connect cap on the
+            // equipment blobs themselves -- they're opaque objects
+            // and any "cheating" of weapon stats would only matter
+            // once we compute damage server-side (later slice).
+            // Stash truncated to cap to prevent join-time inflation.
+            this.playerState[msg.id].weapon = (msg.data && msg.data.rpgWeapon && typeof msg.data.rpgWeapon === 'object') ? { ...msg.data.rpgWeapon } : null;
+            this.playerState[msg.id].rangedWeapon = (msg.data && msg.data.rpgRangedWeapon && typeof msg.data.rpgRangedWeapon === 'object') ? { ...msg.data.rpgRangedWeapon } : null;
+            this.playerState[msg.id].staffWeapon = (msg.data && msg.data.rpgStaffWeapon && typeof msg.data.rpgStaffWeapon === 'object') ? { ...msg.data.rpgStaffWeapon } : null;
+            this.playerState[msg.id].activeSlot = (msg.data && typeof msg.data.rpgActiveSlot === 'string') ? msg.data.rpgActiveSlot : 'melee';
+            this.playerState[msg.id].armor = (msg.data && msg.data.rpgArmor && typeof msg.data.rpgArmor === 'object') ? { ...msg.data.rpgArmor } : null;
+            this.playerState[msg.id].shield = (msg.data && msg.data.rpgShield && typeof msg.data.rpgShield === 'object') ? { ...msg.data.rpgShield } : null;
+            this.playerState[msg.id].amulet = (msg.data && msg.data.rpgAmulet && typeof msg.data.rpgAmulet === 'object') ? { ...msg.data.rpgAmulet } : null;
+            this.playerState[msg.id].weaponStash = (msg.data && Array.isArray(msg.data.rpgWeaponStash)) ? msg.data.rpgWeaponStash.slice(0, this.WEAPON_STASH_CAP) : [];
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
           // Session-only equipment-derived values.  Always read from join
@@ -2224,6 +2331,15 @@ export class GameRoom {
         // buff timer to ps._buffs, emits player_state.
         if (session.id) {
           this._handleCookRecipe(session, msg.payload || msg);
+        }
+        break;
+
+      case 'equip_request':
+        // Swap a weaponStash entry with an active equipment slot.
+        // Server validates stashIdx + slot name, performs the swap,
+        // emits player_state with the new equipment layout.
+        if (session.id) {
+          this._handleEquipRequest(session, msg.payload || msg);
         }
         break;
 
