@@ -770,6 +770,172 @@ export class GameRoom {
         || slot === 'armor' || slot === 'shield' || slot === 'amulet';
   }
 
+  // ═══ Weapon crafting (blacksmith + woodworker) ═══
+  //
+  // Mirrors BLACKSMITH_TIERS + WOODWORKING_TIERS from src/data/
+  // gameSystems.js (20 tiers each).  Only the fields the worker
+  // needs are mirrored (minLvl / tierMult / statReq / *Cost +
+  // wood resource key for ww).  Display fields (label / color /
+  // desc) stay client-only since the worker doesn't render UI.
+  //
+  // Client sends forge_weapon { weaponType, tierKey, isWoodwork }.
+  // Server validates:
+  //   - tierKey exists in the matching tier table
+  //   - ps.lifeSkills.[blacksmithing|woodworking].level >= minLvl
+  //   - ps[required stat] >= statReq (per EQUIP_STAT_MAP)
+  //   - ps.inventory has required ore/wood
+  //   - ps.coins >= goldCost
+  // Then consumes ingredients + coins, mints the new weapon
+  // (matches the client weapon shape exactly), swaps old active
+  // weapon to stash (rejected if stash full), applies crafting XP,
+  // and emits player_state.  Closes the "forge max-tier weapon for
+  // free" cheat: a cheater bypassing the local resource consume
+  // still gets stomped because the worker re-validates + applies.
+  _BLACKSMITH_TIERS_DATA() {
+    // 20 tiers from BLACKSMITH_TIERS.  Keep in sync if the client
+    // ships new tiers (greatsword/sword forge use these via
+    // gearBase = tier key).
+    return {
+      wood:         {minLvl:1, slots:1, oreName:'wood',          oreCost:3,  goldCost:8,    tierMult:1.00, statReq:0  },
+      copper:       {minLvl:6, slots:1, oreName:'copper',        oreCost:3,  goldCost:20,   tierMult:1.12, statReq:10 },
+      iron:         {minLvl:11,slots:1, oreName:'iron',          oreCost:4,  goldCost:35,   tierMult:1.25, statReq:20 },
+      steel:        {minLvl:16,slots:1, oreName:'steel',         oreCost:5,  goldCost:55,   tierMult:1.40, statReq:30 },
+      titanium:     {minLvl:21,slots:1, oreName:'titanium',      oreCost:5,  goldCost:85,   tierMult:1.56, statReq:40 },
+      obsidian:     {minLvl:26,slots:1, oreName:'obsidian',      oreCost:6,  goldCost:120,  tierMult:1.74, statReq:50 },
+      mythril:      {minLvl:31,slots:2, oreName:'mythril',       oreCost:7,  goldCost:170,  tierMult:1.94, statReq:60 },
+      diamond:      {minLvl:36,slots:2, oreName:'diamond',       oreCost:8,  goldCost:240,  tierMult:2.16, statReq:70 },
+      abyssal:      {minLvl:41,slots:2, oreName:'abyssal',       oreCost:9,  goldCost:330,  tierMult:2.40, statReq:80 },
+      dragonbone:   {minLvl:46,slots:2, oreName:'dragonbone',    oreCost:10, goldCost:440,  tierMult:2.68, statReq:90 },
+      shadowsteel:  {minLvl:51,slots:2, oreName:'shadowsteel',   oreCost:11, goldCost:570,  tierMult:2.98, statReq:100},
+      bloodstone:   {minLvl:56,slots:2, oreName:'bloodstone',    oreCost:12, goldCost:720,  tierMult:3.32, statReq:110},
+      runestone:    {minLvl:61,slots:2, oreName:'runite',        oreCost:13, goldCost:900,  tierMult:3.70, statReq:120},
+      sunstone:     {minLvl:66,slots:2, oreName:'sunstone',      oreCost:14, goldCost:1100, tierMult:4.12, statReq:130},
+      demonite:     {minLvl:71,slots:2, oreName:'demonite',      oreCost:15, goldCost:1350, tierMult:4.58, statReq:140},
+      spiritforge:  {minLvl:76,slots:2, oreName:'spiritore',     oreCost:16, goldCost:1650, tierMult:5.10, statReq:150},
+      starforged:   {minLvl:81,slots:2, oreName:'starite',       oreCost:18, goldCost:2000, tierMult:5.68, statReq:160},
+      celestial:    {minLvl:86,slots:2, oreName:'celestite',     oreCost:20, goldCost:2500, tierMult:6.32, statReq:170},
+      antimatter:   {minLvl:91,slots:2, oreName:'antimatter',    oreCost:22, goldCost:3200, tierMult:7.04, statReq:180},
+      worldbreaker: {minLvl:96,slots:2, oreName:'voidcrystal',   oreCost:25, goldCost:4200, tierMult:7.84, statReq:190},
+    };
+  }
+
+  _WOODWORKING_TIERS_DATA() {
+    return {
+      wood:         {minLvl:1, slots:1, wood:'wood',         woodCost:3,  goldCost:8,    tierMult:1.00, statReq:0  },
+      softwood:     {minLvl:6, slots:1, wood:'softwood',     woodCost:3,  goldCost:20,   tierMult:1.12, statReq:10 },
+      hardwood:     {minLvl:11,slots:1, wood:'hardwood',     woodCost:4,  goldCost:35,   tierMult:1.25, statReq:20 },
+      pine:         {minLvl:16,slots:1, wood:'pine_lumber',  woodCost:5,  goldCost:55,   tierMult:1.40, statReq:30 },
+      maple:        {minLvl:21,slots:1, wood:'maple_wood',   woodCost:5,  goldCost:85,   tierMult:1.56, statReq:40 },
+      ironbark:     {minLvl:26,slots:1, wood:'ironbark',     woodCost:6,  goldCost:120,  tierMult:1.74, statReq:50 },
+      crystalwood:  {minLvl:31,slots:2, wood:'crystal_wood', woodCost:7,  goldCost:170,  tierMult:1.94, statReq:60 },
+      elder:        {minLvl:36,slots:2, wood:'elder_wood',   woodCost:8,  goldCost:240,  tierMult:2.16, statReq:70 },
+      spiritwood:   {minLvl:41,slots:2, wood:'spirit_wood',  woodCost:9,  goldCost:330,  tierMult:2.40, statReq:80 },
+      dragonwood:   {minLvl:46,slots:2, wood:'dragon_wood',  woodCost:10, goldCost:440,  tierMult:2.68, statReq:90 },
+      shadowthorn:  {minLvl:51,slots:2, wood:'shadowthorn',  woodCost:11, goldCost:570,  tierMult:2.98, statReq:100},
+      bloodoak:     {minLvl:56,slots:2, wood:'bloodoak',     woodCost:12, goldCost:720,  tierMult:3.32, statReq:110},
+      runewood:     {minLvl:61,slots:2, wood:'runewood',     woodCost:13, goldCost:900,  tierMult:3.70, statReq:120},
+      sunbark:      {minLvl:66,slots:2, wood:'sunbark',      woodCost:14, goldCost:1100, tierMult:4.12, statReq:130},
+      demonwood:    {minLvl:71,slots:2, wood:'demonwood',    woodCost:15, goldCost:1350, tierMult:4.58, statReq:140},
+      ghostwood:    {minLvl:76,slots:2, wood:'ghostwood',    woodCost:16, goldCost:1650, tierMult:5.10, statReq:150},
+      starwood:     {minLvl:81,slots:2, wood:'starwood',     woodCost:18, goldCost:2000, tierMult:5.68, statReq:160},
+      worldtree:    {minLvl:86,slots:2, wood:'worldtree',    woodCost:20, goldCost:2500, tierMult:6.32, statReq:170},
+      voidtimber:   {minLvl:91,slots:2, wood:'void_timber',  woodCost:22, goldCost:3200, tierMult:7.04, statReq:180},
+      worldbreaker: {minLvl:96,slots:2, wood:'voidwood',     woodCost:25, goldCost:4200, tierMult:7.84, statReq:190},
+    };
+  }
+
+  // EQUIP_STAT_MAP mirror.  Used for the forge statReq gate.
+  _equipStatFor(weaponType) {
+    if (weaponType === 'greatsword') return 'power';
+    if (weaponType === 'sword') return 'agility';
+    if (weaponType === 'bow') return 'agility';
+    if (weaponType === 'staff') return 'mind';
+    return 'power';
+  }
+
+  _handleForgeWeapon(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const { weaponType, tierKey, isWoodwork } = payload || {};
+    if (weaponType !== 'greatsword' && weaponType !== 'sword' && weaponType !== 'bow' && weaponType !== 'staff') return;
+    if (typeof tierKey !== 'string') return;
+
+    // Validate woodwork-vs-blacksmith match with weapon type.
+    // Blacksmith forges melee (greatsword/sword); woodworking
+    // forges ranged (bow/staff).  Reject mismatches.
+    const wantWw = (weaponType === 'bow' || weaponType === 'staff');
+    if (wantWw !== !!isWoodwork) return;
+
+    const table = wantWw ? this._WOODWORKING_TIERS_DATA() : this._BLACKSMITH_TIERS_DATA();
+    const tier = table[tierKey];
+    if (!tier) return;
+
+    // Skill level gate
+    const skillName = wantWw ? 'woodworking' : 'blacksmithing';
+    const skillLvl = (ps.lifeSkills && ps.lifeSkills[skillName] && ps.lifeSkills[skillName].level) || 1;
+    if (skillLvl < tier.minLvl) return;
+
+    // Stat gate (per EQUIP_STAT_MAP)
+    const reqStat = this._equipStatFor(weaponType);
+    if ((ps[reqStat] || 0) < (tier.statReq || 0)) return;
+
+    // Coin + resource validation.
+    if ((ps.coins || 0) < tier.goldCost) return;
+    if (!ps.inventory) ps.inventory = {};
+    const resourceKey = wantWw ? ('wood_' + tier.wood) : ('ore_' + tier.oreName + '_ore');
+    const have = ps.inventory[resourceKey] || 0;
+    const cost = wantWw ? tier.woodCost : tier.oreCost;
+    if (have < cost) return;
+
+    // Active slot for the new weapon (matches client logic).
+    const slot = (weaponType === 'bow') ? 'rangedWeapon'
+               : (weaponType === 'staff') ? 'staffWeapon'
+               : 'weapon';
+
+    // Stash full check -- if existing active weapon would need to
+    // be stashed but stash is full, reject (matches client where
+    // stash.push silently no-ops at cap).  Future: auto-sell oldest.
+    const current = ps[slot];
+    if (current) {
+      if (!Array.isArray(ps.weaponStash)) ps.weaponStash = [];
+      if (ps.weaponStash.length >= this.WEAPON_STASH_CAP) return;
+    }
+
+    // Apply: consume resources, mint new weapon, swap old to stash.
+    ps.inventory[resourceKey] -= cost;
+    if (ps.inventory[resourceKey] <= 0) delete ps.inventory[resourceKey];
+    ps.coins -= tier.goldCost;
+
+    if (current) {
+      ps.weaponStash.push(current);
+    }
+    ps[slot] = {
+      type: weaponType,
+      tier: 'common',
+      tierMult: tier.tierMult,
+      element1: null,
+      element2: null,
+      isVolatile: false,
+      // Name is built client-side from display label; server stores
+      // gearBase so the client can reconstruct.
+      name: tierKey + ' ' + weaponType,
+      gearBase: wantWw ? ('ww_' + tierKey) : tierKey,
+      reforgeBonus: null,
+      hardenBonus: null,
+    };
+
+    // Crafting XP -- mirrors client at the forge sites:
+    //   blacksmithing: tier.minLvl * 5
+    //   woodworking:   tier.minLvl * 5  (same formula)
+    this._addLifeSkillXp(ps, skillName, (tier.minLvl || 1) * 5);
+
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   // Unequip an active equipment slot.  Weapons move to stash (if
   // room); armor/shield/amulet simply null out since they don't have
   // a stash today.  Closes the cheat where a client unequips locally
@@ -2429,6 +2595,15 @@ export class GameRoom {
         // armor/shield/amulet -> null).
         if (session.id) {
           this._handleUnequipRequest(session, msg.payload || msg);
+        }
+        break;
+
+      case 'forge_weapon':
+        // Blacksmith / woodworker forge.  Server validates resource +
+        // coin + skill + stat gates, consumes, mints new weapon,
+        // swaps old to stash, applies crafting XP.
+        if (session.id) {
+          this._handleForgeWeapon(session, msg.payload || msg);
         }
         break;
 
