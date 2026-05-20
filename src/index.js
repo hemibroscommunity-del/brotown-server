@@ -436,12 +436,14 @@ export class GameRoom {
         // gap between feet/heads on N-S approaches even though the
         // E-W approach reads as touching.  Weighting dy by Y_SCALE in
         // the range test alone (movement still uses true direction)
-        // tightens the effective Y stopping distance to 45 / 1.5 =
-        // 30 px while keeping the X stopping distance at 45 px, so
-        // the monster ends up at the same perceived contact ring
-        // regardless of approach angle.
+        // tightens the effective Y stopping distance to 45 / Y_SCALE
+        // while keeping the X stopping distance at 45 px, so the
+        // monster ends up at the same perceived contact ring
+        // regardless of approach angle.  Y_SCALE=3.0 -> 15 px N-S
+        // stopping distance (per user: "needs to be about half of
+        // what it is now" from the 30 px v2.3.96 ring).
         const ATTACK_RANGE = 45;
-        const Y_SCALE = 1.5;
+        const Y_SCALE = 3.0;
         if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
           m.targetId = nearest.id;
           const dxA = nearest.x - m.x;
