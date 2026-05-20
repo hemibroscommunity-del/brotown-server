@@ -2029,7 +2029,56 @@ export class GameRoom {
         if (session.id && this.playerState[session.id]) {
           const ps = this.playerState[session.id];
           const oldZone = ps.z;
-          ps.x = msg.x; ps.y = msg.y; ps.d = msg.d || ps.d; ps.z = msg.z || ps.z;
+          const newZone = msg.z || ps.z;
+
+          // ═══ Movement validation (anti-teleport) ═══
+          //
+          // Worker used to trust msg.x / msg.y blindly.  A cheater
+          // could write into the move event and warp anywhere -- which
+          // bypassed the range checks in _handleLootPickup,
+          // _handleNodeStrike, _resolvePvPAttack, and the monster aggro
+          // distance (all of those compare against ps.x/y after the
+          // overwrite).  Now we cap the per-event position delta to a
+          // speed * elapsed-time bound.
+          //
+          // Client max walk speed (calcMoveSpeed in gameSystems.js):
+          //   baseSpd = calcMoveSpeed(agility)/5.0 * SPEED
+          //           = (1 + min(agility*0.0012, 0.60)) * 2.5 px/frame
+          //   Max ~4 px/frame * 60fps = 240 px/sec.  spdBuff adds 15%
+          //   = 276 px/sec.  Dodge / lunge burst ~48 px instantaneously.
+          //
+          // Cap: 500 px/sec sustained + 80 px burst slack (covers
+          // dodge/lunge + a bit of network jitter).  Far below the
+          // egregious "teleport across the room" cheat (1024+ px),
+          // generous enough for legit lag-recovery jumps.
+          //
+          // Zone changes legitimately move the player to a new zone's
+          // spawn coords -- bypass the check on z-change.  Also bypass
+          // on the FIRST move event (no prior position to delta from).
+          if (typeof msg.x !== 'number' || typeof msg.y !== 'number') break;
+          const _now = Date.now();
+          const zoneChanged = newZone !== oldZone;
+          const firstMove = typeof ps.lastMoveAt !== 'number';
+          let accept = true;
+          if (!zoneChanged && !firstMove && typeof ps.x === 'number' && typeof ps.y === 'number') {
+            const dt = Math.max(0.001, (_now - ps.lastMoveAt) / 1000);
+            const maxDist = 500 * dt + 80;
+            const dx = msg.x - ps.x;
+            const dy = msg.y - ps.y;
+            if (dx * dx + dy * dy > maxDist * maxDist) {
+              // Reject: do not update ps.x/y.  Still update lastMoveAt
+              // so spam-bursts don't compound dt.  dropped silently --
+              // client's next legit move will snap back to server view
+              // via the broadcast tick.
+              accept = false;
+            }
+          }
+          ps.lastMoveAt = _now;
+
+          if (accept) {
+            ps.x = msg.x; ps.y = msg.y;
+          }
+          ps.d = msg.d || ps.d; ps.z = newZone;
           ps.vx = msg.vx || 0; ps.vy = msg.vy || 0;
           if (msg.dodging !== undefined) ps.dodging = !!msg.dodging;
           if (msg.blocking !== undefined) ps.blocking = !!msg.blocking;
