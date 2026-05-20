@@ -86,6 +86,15 @@ export class GameRoom {
     this.EVENTS_PER_TICK_CAP = 500;
     this.WEAPON_STASH_CAP = 8; // mirrors WEAPON_STASH_MAX in src/data/gameSystems.js
     this.QUEST_AP_REWARD = 5;  // mirrors QUEST_AP_REWARD in src/data/items.js
+    // §16.8 aggregated TickDelta.  Tick-path mutations (regen,
+    // monster attacks, respawn, combat XP) used to fire individual
+    // _sendPlayerState immediately, producing many small per-player
+    // emits per tick.  Now the tick paths queue here and a single
+    // flush at end-of-tick emits at most one player_state per
+    // affected player per tick.  Action handlers (eat, shop, etc.)
+    // still emit immediately since they're rare and want snappy
+    // response.
+    this.pendingPlayerStateFlush = new Set();
 
     // §16.12 — PvP Lag Compensation
     this.stateHistory = {};
@@ -329,8 +338,7 @@ export class GameRoom {
               if (blockerPs && typeof blockerPs.stamina === 'number') {
                 blockerPs.stamina = Math.max(0, blockerPs.stamina - 15);
                 this._saveRpg(nearest.id, blockerPs);
-                const blockerWs = this._wsBySessionId(nearest.id);
-                if (blockerWs) this._sendPlayerState(blockerWs, nearest.id);
+                this._queuePlayerStateFlush(nearest.id);
               }
               continue;
             }
@@ -359,8 +367,7 @@ export class GameRoom {
             // check feeds the player_died event below.
             if (targetPs) {
               this._saveRpg(nearest.id, targetPs);
-              const victimWs = this._wsBySessionId(nearest.id);
-              if (victimWs) this._sendPlayerState(victimWs, nearest.id);
+              this._queuePlayerStateFlush(nearest.id);
               if (targetPs.hp <= 0 && !targetPs.dying) {
                 this._handlePlayerDeath(targetPs, nearest.id, 'monster:' + m.id);
               }
@@ -1569,6 +1576,24 @@ export class GameRoom {
     } catch (e) {}
   }
 
+  // Queue a player_state emit for the next tick flush.  Used by
+  // tick-path mutators (regen, monster attack, respawn, combat XP)
+  // to coalesce multiple per-tick mutations into one wire emit per
+  // affected player.  Action handlers (eat / shop / forge / etc.)
+  // still call _sendPlayerState directly for immediate response.
+  _queuePlayerStateFlush(playerId) {
+    if (playerId) this.pendingPlayerStateFlush.add(playerId);
+  }
+
+  _flushPendingPlayerStates() {
+    if (this.pendingPlayerStateFlush.size === 0) return;
+    for (const id of this.pendingPlayerStateFlush) {
+      const ws = this._wsBySessionId(id);
+      if (ws) this._sendPlayerState(ws, id);
+    }
+    this.pendingPlayerStateFlush.clear();
+  }
+
   _sendPlayerState(ws, playerId) {
     const ps = this.playerState[playerId];
     if (!ps || !ws) return;
@@ -1856,7 +1881,7 @@ export class GameRoom {
             payload: { zone: 'town' },
           }));
         } catch (e) {}
-        this._sendPlayerState(ws, id);
+        this._queuePlayerStateFlush(id);
       }
     }
   }
@@ -1944,8 +1969,7 @@ export class GameRoom {
 
       if (changed) {
         this._saveRpg(id, ps);
-        const ws = this._wsBySessionId(id);
-        if (ws) this._sendPlayerState(ws, id);
+        this._queuePlayerStateFlush(id);
       }
     }
   }
@@ -2340,8 +2364,8 @@ export class GameRoom {
               },
             }));
           } catch (e) {}
-          this._sendPlayerState(recipWs, rid);
         }
+        this._queuePlayerStateFlush(rid);
       }
 
       // Clear contribution tracking for the next life of this monster.
@@ -2973,8 +2997,7 @@ export class GameRoom {
 
       // Echo authoritative hp + death check.
       this._saveRpg(targetId, targetPs);
-      const victimWs = this._wsBySessionId(targetId);
-      if (victimWs) this._sendPlayerState(victimWs, targetId);
+      this._queuePlayerStateFlush(targetId);
       if (targetPs.hp <= 0 && !targetPs.dying) {
         this._handlePlayerDeath(targetPs, targetId, 'pvp:' + attackerId);
       }
@@ -3038,6 +3061,12 @@ export class GameRoom {
         regenCounter = 0;
         this._tickPlayerRegen();
       }
+
+      // §16.8 aggregated player_state flush.  Tick-path mutations
+      // (monster attacks, regen, respawn, combat XP) queue here
+      // instead of emitting per-mutation, so multiple per-tick
+      // updates to the same player collapse to one wire emit.
+      this._flushPendingPlayerStates();
 
       // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
