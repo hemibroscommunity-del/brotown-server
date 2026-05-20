@@ -300,6 +300,16 @@ export class GameRoom {
             // queuing while the player blocks.
             if (nearest.blocking) {
               m.atkCd = now + this.MONSTER_ATTACK_CD;
+              // Block cost: 15 stamina (mirrors client at BroTown.jsx:2663).
+              // Server is authoritative for stamina now, so deduct here
+              // and echo via player_state so the bar visibly drops.
+              const blockerPs = this.playerState[nearest.id];
+              if (blockerPs && typeof blockerPs.stamina === 'number') {
+                blockerPs.stamina = Math.max(0, blockerPs.stamina - 15);
+                this._saveRpg(nearest.id, blockerPs);
+                const blockerWs = this._wsBySessionId(nearest.id);
+                if (blockerWs) this._sendPlayerState(blockerWs, nearest.id);
+              }
               continue;
             }
             m.atkCd = now + this.MONSTER_ATTACK_CD;
@@ -781,6 +791,10 @@ export class GameRoom {
         unspentT2: ps.unspentT2 || 0,
         hp: typeof ps.hp === 'number' ? ps.hp : 100,
         maxHp: typeof ps.maxHp === 'number' ? ps.maxHp : 100,
+        stamina: typeof ps.stamina === 'number' ? ps.stamina : 100,
+        maxStamina: typeof ps.maxStamina === 'number' ? ps.maxStamina : 100,
+        mana: typeof ps.mana === 'number' ? ps.mana : 100,
+        maxMana: typeof ps.maxMana === 'number' ? ps.maxMana : 100,
       });
     } catch (e) {}
   }
@@ -800,6 +814,10 @@ export class GameRoom {
           unspentT2: ps.unspentT2 || 0,
           hp: typeof ps.hp === 'number' ? ps.hp : (ps.maxHp || 100),
           maxHp: typeof ps.maxHp === 'number' ? ps.maxHp : 100,
+          stamina: typeof ps.stamina === 'number' ? ps.stamina : (ps.maxStamina || 100),
+          maxStamina: typeof ps.maxStamina === 'number' ? ps.maxStamina : 100,
+          mana: typeof ps.mana === 'number' ? ps.mana : (ps.maxMana || 100),
+          maxMana: typeof ps.maxMana === 'number' ? ps.maxMana : 100,
         },
       }));
     } catch (e) {}
@@ -839,12 +857,83 @@ export class GameRoom {
       if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
       ps.hp = Math.min(ps.hp, ps.maxHp);
     }
+    if (typeof payload.maxStamina === 'number' && payload.maxStamina > 0) {
+      ps.maxStamina = Math.max(1, Math.floor(payload.maxStamina));
+      if (typeof ps.stamina !== 'number') ps.stamina = ps.maxStamina;
+      ps.stamina = Math.min(ps.stamina, ps.maxStamina);
+    }
+    if (typeof payload.maxMana === 'number' && payload.maxMana > 0) {
+      ps.maxMana = Math.max(1, Math.floor(payload.maxMana));
+      if (typeof ps.mana !== 'number') ps.mana = ps.maxMana;
+      ps.mana = Math.min(ps.mana, ps.maxMana);
+    }
     if (typeof payload.def === 'number') ps.def = Math.max(0, payload.def);
     if (typeof payload.amuletHpRegen === 'number') ps.amuletHpRegen = Math.max(0, payload.amuletHpRegen);
+    if (typeof payload.amuletStaminaRegen === 'number') ps.amuletStaminaRegen = Math.max(0, payload.amuletStaminaRegen);
     if (typeof payload.restoration === 'number') ps.restoration = Math.max(0, payload.restoration);
-    // Persist hp + maxHp (the bonus fields are session-only).
+    // Persist pool values (the bonus fields are session-only).
     this._saveRpg(session.id, ps);
     const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
+  // ═══ Ability cost gating (server-authoritative stamina / mana) ═══
+  //
+  // Client sends ability_use { type, tier? } when the player triggers
+  // a stamina-/mana-costing action.  Server computes the cost from
+  // ps.maxStamina / hardcoded swipe ramp (mirrors client constants),
+  // validates sufficient pool, deducts, and emits player_state.  A
+  // separate ability_rejected event flies back when the pool is empty
+  // so the client can surface "Not enough stamina!" without waiting on
+  // the player_state diff.
+  //
+  // Closes the "infinite-dodge" / "infinite-stamina write" cheat:
+  // server is the only writer for ps.stamina/mana, so a modified
+  // client that sets R.stamina = 99999 gets stomped on the next
+  // player_state.  Client still predicts the deduction locally for
+  // snappy UX (the dash animates immediately); server's value wins.
+  _abilityCost(ps, type, tier) {
+    if (!ps) return 0;
+    if (type === 'dodge')   return Math.ceil((ps.maxStamina || 100) * 0.20);
+    if (type === 'lunge')   return Math.ceil((ps.maxStamina || 100) * 0.25);
+    if (type === 'retreat') return Math.ceil((ps.maxStamina || 100) * 0.20);
+    if (type === 'swipe')   return 15 + Math.max(0, Math.min(3, tier || 0)) * 3;
+    return 0;
+  }
+
+  _abilityPool(type) {
+    if (type === 'swipe') return 'mana';
+    return 'stamina';
+  }
+
+  _handleAbilityUse(session, payload) {
+    if (!session || !session.id) return;
+    const { type, tier } = payload || {};
+    if (type !== 'dodge' && type !== 'lunge' && type !== 'retreat' && type !== 'swipe') return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const cost = this._abilityCost(ps, type, tier);
+    const pool = this._abilityPool(type);
+    const have = (pool === 'mana') ? (ps.mana || 0) : (ps.stamina || 0);
+    const ws = this._wsBySessionId(session.id);
+    if (have < cost) {
+      if (ws) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'ability_rejected',
+            payload: { type, pool, cost, have },
+          }));
+        } catch (e) {}
+      }
+      return;
+    }
+    if (pool === 'mana') {
+      ps.mana = Math.max(0, have - cost);
+    } else {
+      ps.stamina = Math.max(0, have - cost);
+    }
+    this._saveRpg(session.id, ps);
     if (ws) this._sendPlayerState(ws, session.id);
   }
 
@@ -876,6 +965,8 @@ export class GameRoom {
       if (!ps.dying) continue;
       if (now < (ps.respawnAt || 0)) continue;
       ps.hp = ps.maxHp || 100;
+      ps.stamina = ps.maxStamina || 100;
+      ps.mana = ps.maxMana || 100;
       ps.dying = false;
       ps.dead = false;
       ps.respawnAt = 0;
@@ -895,33 +986,80 @@ export class GameRoom {
     }
   }
 
-  // HP regen tick.  Runs every REGEN_TICK_INTERVAL ticks of the room
-  // tick loop.  OOC (>5 s since last damage) heals fast w/ restoration
-  // + amulet multipliers; in-combat heals slow.  Only emits player_state
-  // when hp actually changed (every regen interval otherwise spams).
+  // Pool regen tick + shield drain.  Runs every 30 server ticks
+  // (~670 ms at TICK_RATE=22) for all three pools:
   //
-  // Rate calibration (see plan file "Regen rate math"):
-  //   OOC:        ceil(maxHp * 0.001 * restMult * amuletMult) * 10
-  //   In-combat:  ceil(maxHp * 0.0005) * 6
-  // Tick interval is 30 server ticks (≈ 670 ms at 45 Hz / TICK_RATE=22).
+  //   HP:
+  //     OOC:        ceil(maxHp * 0.001 * restMult * amuletMult) * 10
+  //     In-combat:  ceil(maxHp * 0.0005) * 6
+  //   Stamina:
+  //     Always:     ~7/tick (matches client's 10/sec at 60 fps),
+  //                 * (1 + amuletStaminaRegen/100)
+  //     Override:   when ps.blocking, drain 5/tick instead of regenning
+  //                 (mirrors client's 0.167/frame * 30 frames shield drain)
+  //   Mana:
+  //     OOC (>2s):  maxMana * 0.018/tick (~2.7%/sec)
+  //     In-combat:  maxMana * 0.007/tick (~1%/sec)
+  //
+  // Only emits player_state when at least one pool actually changed.
+  // Rate calibration is approximate -- see plan file "Regen rate math".
   _tickPlayerRegen() {
     const now = Date.now();
     for (const [id, ps] of Object.entries(this.playerState)) {
       if (!ps || ps.dying || ps.dead || ps.disconnected) continue;
       if (typeof ps.hp !== 'number' || typeof ps.maxHp !== 'number') continue;
-      if (ps.hp >= ps.maxHp) continue;
       const ooc = (now - (ps.lastDamageAt || 0)) > 5000;
-      let heal;
-      if (ooc) {
-        const restMult = 1 + (ps.restoration || 0) * 0.001;
-        const amuletMult = 1 + (ps.amuletHpRegen || 0) / 100;
-        heal = Math.max(1, Math.ceil(ps.maxHp * 0.001 * restMult * amuletMult)) * 10;
-      } else {
-        heal = Math.max(1, Math.ceil(ps.maxHp * 0.0005)) * 6;
+      const oocMana = (now - (ps.lastDamageAt || 0)) > 2000;
+      let changed = false;
+
+      // HP regen
+      if (ps.hp < ps.maxHp) {
+        let heal;
+        if (ooc) {
+          const restMult = 1 + (ps.restoration || 0) * 0.001;
+          const amuletMult = 1 + (ps.amuletHpRegen || 0) / 100;
+          heal = Math.max(1, Math.ceil(ps.maxHp * 0.001 * restMult * amuletMult)) * 10;
+        } else {
+          heal = Math.max(1, Math.ceil(ps.maxHp * 0.0005)) * 6;
+        }
+        const beforeHp = ps.hp;
+        ps.hp = Math.min(ps.maxHp, ps.hp + heal);
+        if (ps.hp !== beforeHp) changed = true;
       }
-      const before = ps.hp;
-      ps.hp = Math.min(ps.maxHp, ps.hp + heal);
-      if (ps.hp !== before) {
+
+      // Stamina: shield drain takes priority over regen.  When blocking,
+      // drain ~5/tick and auto-release at 0 (mirrors client behavior at
+      // BroTown.jsx:9370 -- 0.167 stamina/frame at 60 fps).
+      if (typeof ps.maxStamina === 'number' && typeof ps.stamina === 'number') {
+        if (ps.blocking && ps.stamina > 0) {
+          const beforeSt = ps.stamina;
+          ps.stamina = Math.max(0, ps.stamina - 5);
+          if (ps.stamina !== beforeSt) changed = true;
+          if (ps.stamina <= 0) {
+            // Auto-release shield to match client's drop-at-0 behavior.
+            ps.blocking = false;
+          }
+        } else if (ps.stamina < ps.maxStamina) {
+          const stAmuletMult = 1 + (ps.amuletStaminaRegen || 0) / 100;
+          const stRestMult = 1 + (ps.restoration || 0) * 0.001;
+          const stHeal = Math.max(1, Math.ceil(7 * stAmuletMult * stRestMult));
+          const beforeSt = ps.stamina;
+          ps.stamina = Math.min(ps.maxStamina, ps.stamina + stHeal);
+          if (ps.stamina !== beforeSt) changed = true;
+        }
+      }
+
+      // Mana
+      if (typeof ps.maxMana === 'number' && typeof ps.mana === 'number' && ps.mana < ps.maxMana) {
+        const restMult = 1 + (ps.restoration || 0) * 0.001;
+        const rate = oocMana ? 0.018 : 0.007;
+        const manaHeal = Math.max(1, Math.ceil(ps.maxMana * rate * restMult));
+        const beforeMn = ps.mana;
+        ps.mana = Math.min(ps.maxMana, ps.mana + manaHeal);
+        if (ps.mana !== beforeMn) changed = true;
+      }
+
+      if (changed) {
         this._saveRpg(id, ps);
         const ws = this._wsBySessionId(id);
         if (ws) this._sendPlayerState(ws, id);
@@ -1250,11 +1388,12 @@ export class GameRoom {
         const xpForRecipient = Math.round((m.xp || 0) * share);
         if (xpForRecipient <= 0) continue;
         const { leveled, levelsGained, newLevel } = this._addCombatXp(recipPs, xpForRecipient);
-        // Level-up restores HP to max (mirrors the client's existing
-        // line-up restore behavior at BroTown.jsx:8973).  Stamina + mana
-        // get the same treatment in slice 1b.
-        if (leveled && typeof recipPs.maxHp === 'number') {
-          recipPs.hp = recipPs.maxHp;
+        // Level-up restores all three pools to max (mirrors the client's
+        // existing level-up restore at BroTown.jsx:8973 / 8504 / 9851).
+        if (leveled) {
+          if (typeof recipPs.maxHp === 'number') recipPs.hp = recipPs.maxHp;
+          if (typeof recipPs.maxStamina === 'number') recipPs.stamina = recipPs.maxStamina;
+          if (typeof recipPs.maxMana === 'number') recipPs.mana = recipPs.maxMana;
         }
         this._saveRpg(rid, recipPs);
         const recipWs = this._wsBySessionId(rid);
@@ -1335,6 +1474,10 @@ export class GameRoom {
             this.playerState[msg.id].unspentT2 = stored.unspentT2 || 0;
             this.playerState[msg.id].hp = typeof stored.hp === 'number' ? stored.hp : 100;
             this.playerState[msg.id].maxHp = typeof stored.maxHp === 'number' ? stored.maxHp : 100;
+            this.playerState[msg.id].stamina = typeof stored.stamina === 'number' ? stored.stamina : 100;
+            this.playerState[msg.id].maxStamina = typeof stored.maxStamina === 'number' ? stored.maxStamina : 100;
+            this.playerState[msg.id].mana = typeof stored.mana === 'number' ? stored.mana : 100;
+            this.playerState[msg.id].maxMana = typeof stored.maxMana === 'number' ? stored.maxMana : 100;
           } else {
             this.playerState[msg.id].coins = (msg.data && typeof msg.data.rpgCoins === 'number') ? msg.data.rpgCoins : 0;
             this.playerState[msg.id].inventory = (msg.data && msg.data.rpgInventory && typeof msg.data.rpgInventory === 'object') ? { ...msg.data.rpgInventory } : {};
@@ -1344,13 +1487,18 @@ export class GameRoom {
             this.playerState[msg.id].unspentT2 = (msg.data && typeof msg.data.rpgUnspentT2 === 'number') ? msg.data.rpgUnspentT2 : 0;
             this.playerState[msg.id].hp = (msg.data && typeof msg.data.rpgHp === 'number') ? msg.data.rpgHp : 100;
             this.playerState[msg.id].maxHp = (msg.data && typeof msg.data.rpgMaxHp === 'number') ? msg.data.rpgMaxHp : 100;
+            this.playerState[msg.id].stamina = (msg.data && typeof msg.data.rpgStamina === 'number') ? msg.data.rpgStamina : 100;
+            this.playerState[msg.id].maxStamina = (msg.data && typeof msg.data.rpgMaxStamina === 'number') ? msg.data.rpgMaxStamina : 100;
+            this.playerState[msg.id].mana = (msg.data && typeof msg.data.rpgMana === 'number') ? msg.data.rpgMana : 100;
+            this.playerState[msg.id].maxMana = (msg.data && typeof msg.data.rpgMaxMana === 'number') ? msg.data.rpgMaxMana : 100;
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
-          // Session-only derived stats (def, amulet hpRegen, restoration).
-          // Always read from join — they're recomputed client-side on every
-          // recalcDerived, so the stored entry doesn't need to carry them.
+          // Session-only derived stats.  Always read from join — they're
+          // recomputed client-side on every recalcDerived, so the stored
+          // entry doesn't need to carry them.
           this.playerState[msg.id].def = (msg.data && typeof msg.data.rpgDef === 'number') ? Math.max(0, msg.data.rpgDef) : 0;
           this.playerState[msg.id].amuletHpRegen = (msg.data && typeof msg.data.rpgAmuletHpRegen === 'number') ? Math.max(0, msg.data.rpgAmuletHpRegen) : 0;
+          this.playerState[msg.id].amuletStaminaRegen = (msg.data && typeof msg.data.rpgAmuletStaminaRegen === 'number') ? Math.max(0, msg.data.rpgAmuletStaminaRegen) : 0;
           this.playerState[msg.id].restoration = (msg.data && typeof msg.data.rpgRestoration === 'number') ? Math.max(0, msg.data.rpgRestoration) : 0;
           this.playerState[msg.id].lastDamageAt = 0;
           this.playerState[msg.id].dying = false;
@@ -1504,6 +1652,15 @@ export class GameRoom {
         // the worker's damage math and regen tick use current values.
         if (session.id) {
           this._handleStatsUpdate(session, msg.payload || msg);
+        }
+        break;
+
+      case 'ability_use':
+        // Player triggered a stamina/mana-costing action (dodge / lunge
+        // / retreat / swipe).  Server computes cost from ps.maxStamina
+        // or the swipe ramp, validates, deducts, and emits player_state.
+        if (session.id) {
+          this._handleAbilityUse(session, msg.payload || msg);
         }
         break;
 
