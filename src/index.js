@@ -85,6 +85,7 @@ export class GameRoom {
     this.MAX_PLAYERS = 50;
     this.EVENTS_PER_TICK_CAP = 500;
     this.WEAPON_STASH_CAP = 8; // mirrors WEAPON_STASH_MAX in src/data/gameSystems.js
+    this.QUEST_AP_REWARD = 5;  // mirrors QUEST_AP_REWARD in src/data/items.js
 
     // §16.12 — PvP Lag Compensation
     this.stateHistory = {};
@@ -770,6 +771,120 @@ export class GameRoom {
         || slot === 'armor' || slot === 'shield' || slot === 'amulet';
   }
 
+  // ═══ Quests (accept + turn-in with reward validation) ═══
+  //
+  // Mirrors the 25-quest QUEST_CHAINS table in src/data/gameSystems.js
+  // for reward amounts + chain progression.  The QUEST COMPLETION
+  // CRITERIA (kill counts, item collection, NPC interactions) still
+  // run client-side -- mirroring them all would require porting the
+  // full quest.check predicate for every quest, plus tracking every
+  // mutation that feeds those predicates (loot pickup keys, monster
+  // kills, item drops, etc.).  Out of scope for this slice.
+  //
+  // What this slice closes:
+  //   - quest_turn_in spam for free rewards (server checks state
+  //     transitions: must be 'active' before turning in).
+  //   - Cheater claiming a higher-tier quest's reward by forging
+  //     the questId (server uses its own reward table lookup).
+  //   - Accepting a quest the player isn't supposed to have yet
+  //     (chain order: must be 'available' before active).
+  //
+  // What still depends on client trust:
+  //   - The "quest is actually completed" claim.  Cheater can
+  //     accept a quest, immediately turn it in (without doing the
+  //     work), and get the reward.  Closing this needs server-
+  //     tracked kill counts / inventory acquisition flags / NPC
+  //     dialog state -- a separate, bigger slice.
+  _QUEST_REWARDS_DATA() {
+    return {
+      mayor_1:    {gold:50,  xp:30,  next:'mayor_2'},
+      mayor_2:    {gold:100, xp:80,  next:'mayor_3'},
+      mayor_3:    {gold:300, xp:200, next:null},
+      trader_1:   {gold:25,  xp:20,  next:'trader_2'},
+      trader_2:   {gold:75,  xp:50,  next:'trader_3'},
+      trader_3:   {gold:150, xp:100, next:null},
+      enchant_1:  {gold:50,  xp:40,  next:'enchant_2'},
+      enchant_2:  {gold:200, xp:150, next:'enchant_3'},
+      enchant_3:  {gold:500, xp:300, next:null},
+      scout_1:    {gold:100, xp:80,  next:'scout_2'},
+      scout_2:    {gold:200, xp:150, next:null},
+      bron_1:     {gold:60,  xp:40,  next:'bron_2'},
+      bron_2:     {gold:120, xp:80,  next:'bron_3'},
+      bron_3:     {gold:200, xp:150, next:'bron_4'},
+      bron_4:     {gold:400, xp:250, next:null},
+      luna_1:     {gold:40,  xp:30,  next:'luna_2'},
+      luna_2:     {gold:100, xp:70,  next:'luna_3'},
+      luna_3:     {gold:250, xp:180, next:null},
+      kai_1:      {gold:80,  xp:60,  next:'kai_2'},
+      kai_2:      {gold:200, xp:120, next:'kai_3'},
+      kai_3:      {gold:350, xp:200, next:null},
+      ash_1:      {gold:100, xp:80,  next:'ash_2'},
+      ash_2:      {gold:250, xp:180, next:'ash_3'},
+      ash_3:      {gold:500, xp:350, next:'ash_4'},
+      ash_4:      {gold:800, xp:500, next:null},
+    };
+  }
+
+  // (this.QUEST_AP_REWARD set in constructor; mirrors QUEST_AP_REWARD
+  // in src/data/items.js -- 5 AP per quest.)
+  _handleQuestAccept(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const { questId } = payload || {};
+    if (typeof questId !== 'string') return;
+    const reward = this._QUEST_REWARDS_DATA()[questId];
+    if (!reward) return; // unknown quest
+    if (!ps._quests) ps._quests = {};
+    const cur = ps._quests[questId];
+    // Allow accepting from 'available' (chain entry granted) or
+    // from missing (first quest in chain).  Reject if already
+    // active / turnedIn.
+    if (cur === 'active' || cur === 'turnedIn') return;
+    ps._quests[questId] = 'active';
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
+  _handleQuestTurnIn(session, payload) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    if (ps.dying || ps.dead || ps.disconnected) return;
+    const { questId } = payload || {};
+    if (typeof questId !== 'string') return;
+    const reward = this._QUEST_REWARDS_DATA()[questId];
+    if (!reward) return;
+    if (!ps._quests) ps._quests = {};
+    // Must be 'active' to turn in.  This is the spam-defeat:
+    // a cheater can't reclaim the reward by spamming the event,
+    // and can't claim a quest they never accepted.
+    if (ps._quests[questId] !== 'active') return;
+    ps._quests[questId] = 'turnedIn';
+    ps.coins = (ps.coins || 0) + (reward.gold || 0);
+    // XP via _addCombatXp so level-up logic runs (including
+    // pool restores via _recomputeMaxes inside).
+    if (reward.xp > 0) {
+      const { leveled } = this._addCombatXp(ps, reward.xp);
+      if (leveled) {
+        this._recomputeMaxes(ps);
+        if (typeof ps.maxHp === 'number') ps.hp = ps.maxHp;
+        if (typeof ps.maxStamina === 'number') ps.stamina = ps.maxStamina;
+        if (typeof ps.maxMana === 'number') ps.mana = ps.maxMana;
+      }
+    }
+    ps.achievementPoints = (ps.achievementPoints || 0) + this.QUEST_AP_REWARD;
+    // Unlock next quest in chain.
+    if (reward.next && !ps._quests[reward.next]) {
+      ps._quests[reward.next] = 'available';
+    }
+    this._saveRpg(session.id, ps);
+    const ws = this._wsBySessionId(session.id);
+    if (ws) this._sendPlayerState(ws, session.id);
+  }
+
   // ═══ Weapon crafting (blacksmith + woodworker) ═══
   //
   // Mirrors BLACKSMITH_TIERS + WOODWORKING_TIERS from src/data/
@@ -1409,6 +1524,15 @@ export class GameRoom {
         shield: ps.shield || null,
         amulet: ps.amulet || null,
         weaponStash: Array.isArray(ps.weaponStash) ? ps.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [],
+        // Quest state (slice 17).  Chain progression + flags +
+        // kill counters.  Server validates accept/turn-in state
+        // transitions but currently trusts the client's claim
+        // that the underlying criteria are met -- see comments
+        // on _handleQuestAccept / _handleQuestTurnIn.
+        _quests: ps._quests || {},
+        _questFlags: ps._questFlags || {},
+        _questKills: ps._questKills || {},
+        achievementPoints: ps.achievementPoints || 0,
       });
     } catch (e) {}
   }
@@ -1447,6 +1571,11 @@ export class GameRoom {
           shield: ps.shield || null,
           amulet: ps.amulet || null,
           weaponStash: Array.isArray(ps.weaponStash) ? ps.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [],
+          // Quest state mirror (slice 17).
+          _quests: ps._quests || {},
+          _questFlags: ps._questFlags || {},
+          _questKills: ps._questKills || {},
+          achievementPoints: ps.achievementPoints || 0,
         },
       }));
     } catch (e) {}
@@ -2264,6 +2393,10 @@ export class GameRoom {
             this.playerState[msg.id].shield = stored.shield || null;
             this.playerState[msg.id].amulet = stored.amulet || null;
             this.playerState[msg.id].weaponStash = Array.isArray(stored.weaponStash) ? stored.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [];
+            this.playerState[msg.id]._quests = (stored._quests && typeof stored._quests === 'object') ? { ...stored._quests } : {};
+            this.playerState[msg.id]._questFlags = (stored._questFlags && typeof stored._questFlags === 'object') ? { ...stored._questFlags } : {};
+            this.playerState[msg.id]._questKills = (stored._questKills && typeof stored._questKills === 'object') ? { ...stored._questKills } : {};
+            this.playerState[msg.id].achievementPoints = stored.achievementPoints || 0;
           } else {
             // First-connect bootstrap caps.  Stored values (the
             // branch above) win on reconnect; this branch only runs
@@ -2323,6 +2456,26 @@ export class GameRoom {
             this.playerState[msg.id].shield = (msg.data && msg.data.rpgShield && typeof msg.data.rpgShield === 'object') ? { ...msg.data.rpgShield } : null;
             this.playerState[msg.id].amulet = (msg.data && msg.data.rpgAmulet && typeof msg.data.rpgAmulet === 'object') ? { ...msg.data.rpgAmulet } : null;
             this.playerState[msg.id].weaponStash = (msg.data && Array.isArray(msg.data.rpgWeaponStash)) ? msg.data.rpgWeaponStash.slice(0, this.WEAPON_STASH_CAP) : [];
+            // Quest state bootstrap (slice 17).  Trust shape but not
+            // size -- a cheater could pass a 10000-entry _questKills
+            // map to inflate storage.  Strip non-numeric values and
+            // cap key count.
+            const _qK = (msg.data && msg.data.rpgQuestKills && typeof msg.data.rpgQuestKills === 'object') ? msg.data.rpgQuestKills : {};
+            const _qKclean = {};
+            let _qKc = 0;
+            for (const [k, v] of Object.entries(_qK)) {
+              if (_qKc >= 50) break;
+              const n = Number(v);
+              if (Number.isFinite(n) && n >= 0) {
+                _qKclean[k] = Math.min(99999, Math.floor(n));
+                _qKc++;
+              }
+            }
+            this.playerState[msg.id]._quests = (msg.data && msg.data.rpgQuests && typeof msg.data.rpgQuests === 'object') ? { ...msg.data.rpgQuests } : {};
+            this.playerState[msg.id]._questFlags = (msg.data && msg.data.rpgQuestFlags && typeof msg.data.rpgQuestFlags === 'object') ? { ...msg.data.rpgQuestFlags } : {};
+            this.playerState[msg.id]._questKills = _qKclean;
+            this.playerState[msg.id].achievementPoints = Math.max(0, Math.min(99999,
+              (msg.data && typeof msg.data.rpgAchievementPoints === 'number') ? Math.floor(msg.data.rpgAchievementPoints) : 0));
             await this._saveRpg(msg.id, this.playerState[msg.id]);
           }
           // Session-only equipment-derived values.  Always read from join
@@ -2632,6 +2785,24 @@ export class GameRoom {
         // swaps old to stash, applies crafting XP.
         if (session.id) {
           this._handleForgeWeapon(session, msg.payload || msg);
+        }
+        break;
+
+      case 'quest_accept':
+        // Player accepted a quest from the NPC dialog.  Server
+        // validates the questId + current state, transitions to
+        // 'active'.
+        if (session.id) {
+          this._handleQuestAccept(session, msg.payload || msg);
+        }
+        break;
+
+      case 'quest_turn_in':
+        // Player turning in a completed quest.  Server validates
+        // 'active' state + applies reward (gold + xp + AP) + unlocks
+        // next in chain.
+        if (session.id) {
+          this._handleQuestTurnIn(session, msg.payload || msg);
         }
         break;
 
