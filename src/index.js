@@ -511,11 +511,31 @@ export class GameRoom {
               // Server is authoritative for stamina now, so deduct here
               // and echo via player_state so the bar visibly drops.
               const blockerPs = this.playerState[nearest.id];
+              const staminaCost = 15;
               if (blockerPs && typeof blockerPs.stamina === 'number') {
-                blockerPs.stamina = Math.max(0, blockerPs.stamina - 15);
+                blockerPs.stamina = Math.max(0, blockerPs.stamina - staminaCost);
                 this._saveRpg(nearest.id, blockerPs);
                 this._queuePlayerStateFlush(nearest.id);
               }
+              // Still emit a monster_attack event so the client can show
+              // the "Blocked!" popup + the stamina drain.  blocked: true
+              // tells the client to skip the HP-damage path entirely;
+              // staminaDrain rides on the wire so the floating number
+              // matches the exact server-side cost.
+              this.eventBuffer.push({
+                type: 'monster_attack',
+                payload: {
+                  monsterId: m.id,
+                  targetId: nearest.id,
+                  dmg: m.dmg,
+                  dmgTaken: 0,
+                  blocked: true,
+                  staminaDrain: staminaCost,
+                  zone: zoneId,
+                  attackerX: m.x,
+                  attackerY: m.y,
+                }
+              });
               continue;
             }
             m.atkCd = now + this.MONSTER_ATTACK_CD;
