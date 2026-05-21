@@ -3028,6 +3028,26 @@ export class GameRoom {
         }
         break;
 
+      case 'set_active_slot': {
+        // Persist the player's chosen weapon slot.  Without this, any
+        // subsequent player_state (loot / kill / credit event) would
+        // carry the worker's stale activeSlot and revert the client's
+        // local cycle.  No broadcast back -- the client already updated
+        // locally, and the next server-driven player_state will carry
+        // the now-fresh persisted value.
+        if (session.id) {
+          const ps = this.playerState[session.id];
+          if (ps) {
+            const slot = msg.payload && msg.payload.slot;
+            if (slot === 'melee' || slot === 'ranged' || slot === 'staff') {
+              ps.activeSlot = slot;
+              this._saveRpg(session.id, ps);
+            }
+          }
+        }
+        break;
+      }
+
       case 'forge_weapon':
         // Blacksmith / woodworker forge.  Server validates resource +
         // coin + skill + stat gates, consumes, mints new weapon,
