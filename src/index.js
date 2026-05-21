@@ -530,15 +530,64 @@ export class GameRoom {
             zoneChanged = true;
           }
         } else {
-          // Idle wander — slow random movement back toward spawn
+          // Idle wander -- pick a random target point within
+          // WANDER_RADIUS px of spawn, walk to it, then sit for a
+          // brief pause before picking the next one.  Previously this
+          // branch only "returned to spawn" so monsters at/near spawn
+          // sat still all day -- the v2.3.100 user-reported
+          // "passive monsters are frozen" symptom.  Tunables:
+          //   WANDER_RADIUS  - max distance from spawn the monster
+          //                    will ever wander to.
+          //   WANDER_PAUSE_*  - random pause range between segments.
+          //   WANDER_REACH    - close-enough threshold to count the
+          //                    wander target as reached.
           m.targetId = null;
-          const dxSpawn = m.spawnX - m.x;
-          const dySpawn = m.spawnY - m.y;
-          const distSpawn = Math.sqrt(dxSpawn * dxSpawn + dySpawn * dySpawn);
-          if (distSpawn > 30) {
-            m.x += (dxSpawn / distSpawn) * m.spd * 0.3;
-            m.y += (dySpawn / distSpawn) * m.spd * 0.3;
+          const WANDER_RADIUS = 120;
+          const WANDER_REACH = 8;
+          const WANDER_PAUSE_MIN_MS = 1500;
+          const WANDER_PAUSE_MAX_MS = 4000;
+          const WANDER_LEASH = 220; // hard pull-back if monster drifts far
+          const distSpawn = Math.sqrt(
+            (m.spawnX - m.x) * (m.spawnX - m.x) +
+            (m.spawnY - m.y) * (m.spawnY - m.y)
+          );
+          if (distSpawn > WANDER_LEASH) {
+            // Got pushed/dragged way past leash -- pull straight back
+            // to spawn area before resuming wander.
+            const dxL = m.spawnX - m.x;
+            const dyL = m.spawnY - m.y;
+            m.x += (dxL / distSpawn) * m.spd * 0.5;
+            m.y += (dyL / distSpawn) * m.spd * 0.5;
             zoneChanged = true;
+          } else {
+            // Pick a fresh wander target when current one expires.
+            if (!m._wanderUntil || now >= m._wanderUntil) {
+              const ang = Math.random() * Math.PI * 2;
+              const rad = Math.random() * WANDER_RADIUS;
+              m._wanderTx = m.spawnX + Math.cos(ang) * rad;
+              m._wanderTy = m.spawnY + Math.sin(ang) * rad;
+              m._wanderUntil = now + WANDER_PAUSE_MIN_MS
+                + Math.random() * (WANDER_PAUSE_MAX_MS - WANDER_PAUSE_MIN_MS);
+              m._wanderPausedUntil = 0;
+            }
+            if (m._wanderPausedUntil && now < m._wanderPausedUntil) {
+              // Pause segment -- standing still between walks.
+            } else {
+              const dxw = m._wanderTx - m.x;
+              const dyw = m._wanderTy - m.y;
+              const distw = Math.sqrt(dxw * dxw + dyw * dyw);
+              if (distw < WANDER_REACH) {
+                // Reached target -- sit briefly then a new target
+                // gets picked on the next tick after _wanderUntil
+                // expires.  Short pause feels more alive than
+                // ping-ponging instantly.
+                m._wanderPausedUntil = now + 500 + Math.random() * 1500;
+              } else {
+                m.x += (dxw / distw) * m.spd * 0.3;
+                m.y += (dyw / distw) * m.spd * 0.3;
+                zoneChanged = true;
+              }
+            }
           }
         }
       }
