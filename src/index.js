@@ -530,63 +530,72 @@ export class GameRoom {
             zoneChanged = true;
           }
         } else {
-          // Idle wander -- pick a random target point within
-          // WANDER_RADIUS px of spawn, walk to it, then sit for a
-          // brief pause before picking the next one.  Previously this
-          // branch only "returned to spawn" so monsters at/near spawn
-          // sat still all day -- the v2.3.100 user-reported
-          // "passive monsters are frozen" symptom.  Tunables:
-          //   WANDER_RADIUS  - max distance from spawn the monster
-          //                    will ever wander to.
-          //   WANDER_PAUSE_*  - random pause range between segments.
-          //   WANDER_REACH    - close-enough threshold to count the
-          //                    wander target as reached.
+          // Idle wander -- pick a random target ~30-80 px from the
+          // monster's current position (within WANDER_LEASH of spawn),
+          // walk to it at full spd, pause 0.5-1.5s on arrival, then
+          // pick the next one.
+          //
+          // Why no time-based target expiry: slow variants (mummy 0.4
+          // spd) can't traverse 100 px in 4s, and the previous "expire
+          // after 1.5-4s no matter what" loop made them re-roll long
+          // before they ever reached the target -- net displacement
+          // per target was ~5 px, the user-reported "severely
+          // limited" symptom.  Targets now persist until reached or
+          // the leash pull-back overrides.
           m.targetId = null;
-          const WANDER_RADIUS = 120;
-          const WANDER_REACH = 8;
-          const WANDER_PAUSE_MIN_MS = 1500;
-          const WANDER_PAUSE_MAX_MS = 4000;
-          const WANDER_LEASH = 220; // hard pull-back if monster drifts far
+          const WANDER_STEP_MIN = 30;
+          const WANDER_STEP_MAX = 80;
+          const WANDER_REACH = 6;
+          const WANDER_PAUSE_MIN_MS = 500;
+          const WANDER_PAUSE_MAX_MS = 1500;
+          const WANDER_LEASH = 180; // hard pull-back if monster drifts far
           const distSpawn = Math.sqrt(
             (m.spawnX - m.x) * (m.spawnX - m.x) +
             (m.spawnY - m.y) * (m.spawnY - m.y)
           );
           if (distSpawn > WANDER_LEASH) {
-            // Got pushed/dragged way past leash -- pull straight back
-            // to spawn area before resuming wander.
             const dxL = m.spawnX - m.x;
             const dyL = m.spawnY - m.y;
-            m.x += (dxL / distSpawn) * m.spd * 0.5;
-            m.y += (dyL / distSpawn) * m.spd * 0.5;
+            m.x += (dxL / distSpawn) * m.spd;
+            m.y += (dyL / distSpawn) * m.spd;
             zoneChanged = true;
+            m._wanderTx = null;
+            m._wanderTy = null;
+          } else if (m._wanderPausedUntil && now < m._wanderPausedUntil) {
+            // Mid-pause between wander legs -- standing still.
           } else {
-            // Pick a fresh wander target when current one expires.
-            if (!m._wanderUntil || now >= m._wanderUntil) {
+            // Pick a fresh target if we don't have one (just reached
+            // the last one, just spawned, or got pulled by the leash).
+            if (m._wanderTx == null || m._wanderTy == null) {
               const ang = Math.random() * Math.PI * 2;
-              const rad = Math.random() * WANDER_RADIUS;
-              m._wanderTx = m.spawnX + Math.cos(ang) * rad;
-              m._wanderTy = m.spawnY + Math.sin(ang) * rad;
-              m._wanderUntil = now + WANDER_PAUSE_MIN_MS
-                + Math.random() * (WANDER_PAUSE_MAX_MS - WANDER_PAUSE_MIN_MS);
-              m._wanderPausedUntil = 0;
-            }
-            if (m._wanderPausedUntil && now < m._wanderPausedUntil) {
-              // Pause segment -- standing still between walks.
-            } else {
-              const dxw = m._wanderTx - m.x;
-              const dyw = m._wanderTy - m.y;
-              const distw = Math.sqrt(dxw * dxw + dyw * dyw);
-              if (distw < WANDER_REACH) {
-                // Reached target -- sit briefly then a new target
-                // gets picked on the next tick after _wanderUntil
-                // expires.  Short pause feels more alive than
-                // ping-ponging instantly.
-                m._wanderPausedUntil = now + 500 + Math.random() * 1500;
-              } else {
-                m.x += (dxw / distw) * m.spd * 0.3;
-                m.y += (dyw / distw) * m.spd * 0.3;
-                zoneChanged = true;
+              const step = WANDER_STEP_MIN + Math.random() * (WANDER_STEP_MAX - WANDER_STEP_MIN);
+              let tx = m.x + Math.cos(ang) * step;
+              let ty = m.y + Math.sin(ang) * step;
+              // Clamp inside the leash circle around spawn so wander
+              // doesn't accumulate outward drift over many segments.
+              const dxC = tx - m.spawnX;
+              const dyC = ty - m.spawnY;
+              const distC = Math.sqrt(dxC * dxC + dyC * dyC);
+              if (distC > WANDER_LEASH * 0.8) {
+                const k = (WANDER_LEASH * 0.8) / Math.max(distC, 1);
+                tx = m.spawnX + dxC * k;
+                ty = m.spawnY + dyC * k;
               }
+              m._wanderTx = tx;
+              m._wanderTy = ty;
+            }
+            const dxw = m._wanderTx - m.x;
+            const dyw = m._wanderTy - m.y;
+            const distw = Math.sqrt(dxw * dxw + dyw * dyw);
+            if (distw < WANDER_REACH) {
+              m._wanderTx = null;
+              m._wanderTy = null;
+              m._wanderPausedUntil = now + WANDER_PAUSE_MIN_MS
+                + Math.random() * (WANDER_PAUSE_MAX_MS - WANDER_PAUSE_MIN_MS);
+            } else {
+              m.x += (dxw / distw) * m.spd;
+              m.y += (dyw / distw) * m.spd;
+              zoneChanged = true;
             }
           }
         }
