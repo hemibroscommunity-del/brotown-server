@@ -409,16 +409,38 @@ export class GameRoom {
           }
         }
 
-        // Find nearest player for aggro
+        // Find nearest player for aggro.  If the monster has a recent
+        // sticky-aggro override (someone shot it with a bow, etc.),
+        // prefer that target even if they're outside proximity range.
+        // This is what makes ranged attacks actually pull a monster
+        // off its wander -- previously aggro was proximity-only so a
+        // sniped mummy just took the hit and kept patrolling.
         let nearest = null;
         let nearestDist = Infinity;
-        for (const p of playersInZone) {
-          const dx = p.x - m.x;
-          const dy = p.y - m.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < nearestDist) {
-            nearest = p;
-            nearestDist = dist;
+        const stickyAggroActive = m._aggroOverrideUntil && now < m._aggroOverrideUntil;
+        if (stickyAggroActive) {
+          const stickyP = playersInZone.find(p => p.id === m._aggroOverrideTarget);
+          if (stickyP) {
+            const dxS = stickyP.x - m.x;
+            const dyS = stickyP.y - m.y;
+            nearest = stickyP;
+            nearestDist = Math.sqrt(dxS * dxS + dyS * dyS);
+          } else {
+            // Sticky target left the zone -- drop the override and
+            // fall through to proximity.
+            m._aggroOverrideTarget = null;
+            m._aggroOverrideUntil = 0;
+          }
+        }
+        if (!nearest) {
+          for (const p of playersInZone) {
+            const dx = p.x - m.x;
+            const dy = p.y - m.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < nearestDist) {
+              nearest = p;
+              nearestDist = dist;
+            }
           }
         }
 
@@ -444,7 +466,13 @@ export class GameRoom {
         // what it is now" from the 30 px v2.3.96 ring).
         const ATTACK_RANGE = 45;
         const Y_SCALE = 3.0;
-        if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
+        // Effective aggro range -- bumps to 1200 px when the sticky
+        // override is active, so a bow-snipe from anywhere on screen
+        // pulls the monster.  Without the bump the monster could be
+        // damaged but still wouldn't pass the proximity gate to enter
+        // the chase branch.
+        const effAggroRange = stickyAggroActive ? 1200 : this.MONSTER_AGGRO_RANGE;
+        if (nearest && nearestDist < effAggroRange) {
           m.targetId = nearest.id;
           const dxA = nearest.x - m.x;
           const dyA = nearest.y - m.y;
@@ -2455,6 +2483,16 @@ export class GameRoom {
     // without it stay compatible.
     if (!m.dmgByPlayer) m.dmgByPlayer = {};
     m.dmgByPlayer[session.id] = (m.dmgByPlayer[session.id] || 0) + actualDmg;
+
+    // Sticky-aggro override -- being hit pulls the monster onto its
+    // attacker regardless of proximity, so a player sniping with a bow
+    // from outside MONSTER_AGGRO_RANGE doesn't just see the mummy
+    // shrug it off and keep wandering.  Re-stamped on every hit, so
+    // an active fight keeps the target locked even between proximity
+    // checks.  _tickMonsters checks _aggroOverrideUntil first when
+    // choosing a target.
+    m._aggroOverrideTarget = session.id;
+    m._aggroOverrideUntil = Date.now() + 10000;
 
     this.dirtyMonsters.add(zone);
 
