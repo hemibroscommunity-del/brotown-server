@@ -870,27 +870,54 @@ export class GameRoom {
     return Math.ceil(at100 * Math.pow(1.08, L - 100));
   }
 
-  // Apply combat XP, level-up loop, +5 unspentT2 per level (GDD §1.4).
-  // Returns { leveled, levelsGained, newLevel } so the caller can
-  // emit a combat_credit event for the picker's level-up popup +
-  // SFX.  Mutates ps.level, ps.xp, ps.unspentT2 in place.
+  // Accumulate combat XP for the bar / analytics only.  Per
+  // docs/specs/build-points-gate-server.md, combat level-up is now
+  // gated purely on build points (5 BP = 1 level, fired by the
+  // build_point_earned event), not on XP thresholds.  killXp still
+  // accumulates on ps.xp so the XP bar can repurpose into a BP bar
+  // or analytics without losing the running total.
   _addCombatXp(ps, xpAmt) {
     if (!ps) return { leveled: false, levelsGained: 0, newLevel: 1 };
     ps.level = ps.level || 1;
     ps.xp = (ps.xp || 0) + (xpAmt || 0);
+    return { leveled: false, levelsGained: 0, newLevel: ps.level };
+  }
+
+  // Drain build points into combat levels: every 5 BP = +1 level +
+  // 5 unspentT2 + full pool restore.  Carries excess (10 BP → +2
+  // levels).  Returns { leveled, levelsGained, newLevel } matching
+  // the old _addCombatXp shape so combat_credit consumers keep
+  // working unchanged.
+  _tryLevelUpFromBuildPoints(ps) {
+    if (!ps) return { leveled: false, levelsGained: 0, newLevel: 1 };
+    ps.level = ps.level || 1;
     ps.unspentT2 = ps.unspentT2 || 0;
+    ps.buildPointsThisLvl = ps.buildPointsThisLvl || 0;
     let levelsGained = 0;
     const LEVEL_CAP = 100;
-    while (ps.level < LEVEL_CAP && ps.xp >= this._xpRequiredForLevel(ps.level)) {
-      ps.xp -= this._xpRequiredForLevel(ps.level);
+    while (ps.level < LEVEL_CAP && ps.buildPointsThisLvl >= 5) {
+      ps.buildPointsThisLvl -= 5;
       ps.level += 1;
       ps.unspentT2 += 5;
       levelsGained += 1;
     }
-    // At cap, drop any further xp so the counter doesn't overflow
-    // Number.MAX_SAFE_INTEGER after extreme play.
-    if (ps.level >= LEVEL_CAP) ps.xp = 0;
+    if (levelsGained > 0) {
+      this._recomputeMaxes(ps);
+      if (typeof ps.maxHp === 'number') ps.hp = ps.maxHp;
+      if (typeof ps.maxStamina === 'number') ps.stamina = ps.maxStamina;
+      if (typeof ps.maxMana === 'number') ps.mana = ps.maxMana;
+    }
     return { leveled: levelsGained > 0, levelsGained, newLevel: ps.level };
+  }
+
+  _handleBuildPointEarned(session) {
+    if (!session || !session.id) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    ps.buildPointsThisLvl = (ps.buildPointsThisLvl || 0) + 1;
+    this._tryLevelUpFromBuildPoints(ps);
+    this._saveRpg(session.id, ps);
+    this._queuePlayerStateFlush(session.id);
   }
 
   // ═══ T2 stat allocation (server-validated) ═══
@@ -1782,6 +1809,7 @@ export class GameRoom {
         level: ps.level || 1,
         xp: ps.xp || 0,
         unspentT2: ps.unspentT2 || 0,
+        buildPointsThisLvl: ps.buildPointsThisLvl || 0,
         hp: typeof ps.hp === 'number' ? ps.hp : 100,
         maxHp: typeof ps.maxHp === 'number' ? ps.maxHp : 100,
         stamina: typeof ps.stamina === 'number' ? ps.stamina : 100,
@@ -1867,6 +1895,7 @@ export class GameRoom {
           level: ps.level || 1,
           xp: ps.xp || 0,
           unspentT2: ps.unspentT2 || 0,
+          buildPointsThisLvl: ps.buildPointsThisLvl || 0,
           hp: typeof ps.hp === 'number' ? ps.hp : (ps.maxHp || 100),
           maxHp: typeof ps.maxHp === 'number' ? ps.maxHp : 100,
           stamina: typeof ps.stamina === 'number' ? ps.stamina : (ps.maxStamina || 100),
@@ -2733,6 +2762,7 @@ export class GameRoom {
             this.playerState[msg.id].level = stored.level || 1;
             this.playerState[msg.id].xp = stored.xp || 0;
             this.playerState[msg.id].unspentT2 = stored.unspentT2 || 0;
+            this.playerState[msg.id].buildPointsThisLvl = stored.buildPointsThisLvl || 0;
             this.playerState[msg.id].hp = typeof stored.hp === 'number' ? stored.hp : 100;
             this.playerState[msg.id].maxHp = typeof stored.maxHp === 'number' ? stored.maxHp : 100;
             this.playerState[msg.id].stamina = typeof stored.stamina === 'number' ? stored.stamina : 100;
@@ -2798,6 +2828,11 @@ export class GameRoom {
               (msg.data && typeof msg.data.rpgXp === 'number') ? Math.floor(msg.data.rpgXp) : 0));
             this.playerState[msg.id].unspentT2 = Math.max(0, Math.min(BOOTSTRAP_UT2_CAP,
               (msg.data && typeof msg.data.rpgUnspentT2 === 'number') ? Math.floor(msg.data.rpgUnspentT2) : 0));
+            // build_point_earned dispatches own up to 4 in a flurry on
+            // a multi-stat-threshold crossing -- cap at 4 on bootstrap
+            // so a cheater can't seed a huge BP carry-over.
+            this.playerState[msg.id].buildPointsThisLvl = Math.max(0, Math.min(4,
+              (msg.data && typeof msg.data.rpgBuildPointsThisLvl === 'number') ? Math.floor(msg.data.rpgBuildPointsThisLvl) : 0));
             this.playerState[msg.id].hp = (msg.data && typeof msg.data.rpgHp === 'number') ? msg.data.rpgHp : 100;
             this.playerState[msg.id].maxHp = (msg.data && typeof msg.data.rpgMaxHp === 'number') ? msg.data.rpgMaxHp : 100;
             this.playerState[msg.id].stamina = (msg.data && typeof msg.data.rpgStamina === 'number') ? msg.data.rpgStamina : 100;
@@ -3178,6 +3213,16 @@ export class GameRoom {
         // armor/shield/amulet -> null).
         if (session.id) {
           this._handleUnequipRequest(session, msg.payload || msg);
+        }
+        break;
+
+      case 'build_point_earned':
+        // Client crossed a T1 stat threshold inside addBuildProg.
+        // Server increments buildPointsThisLvl and runs the 5-BP-per-
+        // level loop (per docs/specs/build-points-gate-server.md).
+        // Combat XP no longer gates level-up; only build points do.
+        if (session.id) {
+          this._handleBuildPointEarned(session);
         }
         break;
 
