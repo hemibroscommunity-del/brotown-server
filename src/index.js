@@ -59,7 +59,7 @@ export default {
 const PRIVILEGED_EVENTS = new Set([
   // Pool / progression mirrors
   'player_state', 'player_died', 'player_respawned',
-  'combat_credit', 'harvest_credit', 'loot_credit',
+  'combat_credit', 'harvest_credit', 'loot_credit', 'lifesteal_credit',
   'stat_allocated', 'ability_rejected',
   // Combat resolution
   'monster_attack', 'monster_hit', 'monster_kill', 'pvp_hit',
@@ -548,6 +548,7 @@ export class GameRoom {
             // defensive in case the path changes.
             const targetPs = this.playerState[nearest.id];
             const dmgTaken = this._applyDamage(targetPs, m.dmg, false);
+            this._trackMonsterDamage(targetPs, m.id, dmgTaken);
             this.eventBuffer.push({
               type: 'monster_attack',
               payload: {
@@ -1924,6 +1925,32 @@ export class GameRoom {
     return dmgTaken;
   }
 
+  // ═══ Melee lifesteal (per docs/specs/lifesteal-server.md) ═══
+  //
+  // Track net damage each monster has dealt to a player; on a melee
+  // kill, refund 90% of that accumulated amount as healing.  Only
+  // melee kills qualify (ranged/staff use a separate vitality-progress
+  // path, not health).  Ephemeral session state -- not persisted.
+  _trackMonsterDamage(ps, monsterId, amount) {
+    if (!ps || !monsterId || !(amount > 0)) return;
+    if (!ps.dmgFromMonster) ps.dmgFromMonster = {};
+    ps.dmgFromMonster[monsterId] = (ps.dmgFromMonster[monsterId] || 0) + amount;
+  }
+
+  _applyMeleeLifesteal(ps, monsterId) {
+    if (!ps || !monsterId) return 0;
+    const slot = ps.activeSlot || 'melee';
+    if (slot !== 'melee') return 0;
+    if (!ps.dmgFromMonster) return 0;
+    const taken = ps.dmgFromMonster[monsterId] || 0;
+    if (taken <= 0) return 0;
+    const refund = Math.ceil(taken * 0.9);
+    const maxHp = ps.maxHp || 100;
+    ps.hp = Math.min(maxHp, (ps.hp || 0) + refund);
+    delete ps.dmgFromMonster[monsterId];
+    return refund;
+  }
+
   // Apply stats_update payload to playerState.  Client sends after
   // every recalcDerived (BroTown.jsx mutation sites listed in the plan).
   // Clamps current hp to the new maxHp so re-derives that shrink the
@@ -2103,6 +2130,7 @@ export class GameRoom {
     ps.dying = true;
     ps.dead = true;
     ps.respawnAt = Date.now() + 5000;
+    ps.dmgFromMonster = {};
     const ws = this._wsBySessionId(playerId);
     if (ws) {
       try {
@@ -2642,6 +2670,26 @@ export class GameRoom {
         this._queuePlayerStateFlush(rid);
       }
 
+      // Melee lifesteal -- refund 90% of net damage the killer took
+      // from this monster, if the kill was struck with melee.  Heals
+      // the killer (last-hit attribution); party members who tagged
+      // but didn't land the kill get nothing.  Mirrors the client's
+      // existing applyMeleeLifesteal (slated for removal once this
+      // server path is the source of truth).
+      const refund = this._applyMeleeLifesteal(attackerPs, m.id);
+      if (refund > 0) {
+        const killerWs = this._wsBySessionId(session.id);
+        if (killerWs) {
+          try {
+            killerWs.send(JSON.stringify({
+              type: 'lifesteal_credit',
+              payload: { monsterId: m.id, refund },
+            }));
+          } catch (e) {}
+        }
+        this._queuePlayerStateFlush(session.id);
+      }
+
       // Clear contribution tracking for the next life of this monster.
       m.dmgByPlayer = {};
     }
@@ -2958,6 +3006,9 @@ export class GameRoom {
 
           // Zone change handling.
           if (ps.z !== oldZone) {
+            // Lifesteal damage tracking is per-zone; clear so a kill
+            // in the new zone can't refund off old-zone monster IDs.
+            ps.dmgFromMonster = {};
             if (ps.z !== 'town' && ps.z !== 'farm_home') {
               // Combat zone -- send the new zone's monster + gather +
               // loot state so the client can render them.
