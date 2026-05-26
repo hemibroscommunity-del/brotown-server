@@ -2112,7 +2112,13 @@ export class GameRoom {
     if (type === 'dodge')   return Math.ceil((ps.maxStamina || 100) * 0.20);
     if (type === 'lunge')   return Math.ceil((ps.maxStamina || 100) * 0.25);
     if (type === 'retreat') return Math.ceil((ps.maxStamina || 100) * 0.20);
-    if (type === 'swipe')   return 15 + Math.max(0, Math.min(3, tier || 0)) * 3;
+    // Swipe (special attack): v2.3.172+ the client HUD shows MP as a
+    // 5-segment charge meter where each segment funds exactly one
+    // special, so cost MUST be maxMana / 5 to keep the contract.
+    // payload.tier still rides the wire for back-compat but no longer
+    // affects cost (it still scales DAMAGE client-side via
+    // SPECIAL_ATK_MULT).
+    if (type === 'swipe')   return Math.floor((ps.maxMana || 100) / 5);
     return 0;
   }
 
