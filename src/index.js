@@ -2160,11 +2160,13 @@ export class GameRoom {
     ps.dead = true;
     ps.respawnAt = Date.now() + 5000;
     ps.dmgFromMonster = {};
-    // Drop all general inventory on death (mummy remains, fish, wood,
+    // Spawn a pickable death pile at the death location carrying the
+    // player's entire general inventory (mummy remains, fish, wood,
     // etc.).  Equipped loadout (weapon / rangedWeapon / staffWeapon /
-    // armor / shield / amulet) and weaponStash are preserved -- only
-    // the consumable/material inventory is wiped.  Coins are untouched
-    // here; the client still applies its own DEATH_GOLD_PENALTY.
+    // armor / shield / amulet) and weaponStash are NOT included.
+    // Anyone in the zone can pick the pile up; despawns after 60 s.
+    // Spawn BEFORE the inventory wipe so we capture the items.
+    this._spawnDeathPile(ps, playerId);
     ps.inventory = {};
     this._saveRpg(playerId, ps);
     this._queuePlayerStateFlush(playerId);
@@ -2340,7 +2342,59 @@ export class GameRoom {
       killerName: p.killerName,
       ts: p.ts,
       inventoryClaimed: p.inventoryClaimed,
+      // Death-drop fields (null for normal monster-kill piles).
+      isDeathDrop: p.isDeathDrop || false,
+      deathItems: p.deathItems || null,
+      expiry: p.expiry || null,
     };
+  }
+
+  // Spawn a death pile at the dying player's location carrying their
+  // entire general inventory (mummy remains, fish, wood, etc.).
+  // Equipped loadout + weaponStash are NOT included -- caller wipes
+  // ps.inventory after this returns.  Anyone in the zone can pick the
+  // pile up (recipients=null bypasses the recipient gate in
+  // _handleLootPickup); first picker gets everything.  TTL is the
+  // standard LOOT_EXPIRY_MS (60 s) so _tickLoot despawns it on schedule.
+  _spawnDeathPile(ps, playerId) {
+    if (!ps || !ps.inventory) return null;
+    const items = [];
+    for (const [k, v] of Object.entries(ps.inventory)) {
+      const qty = Math.floor(Number(v) || 0);
+      if (qty > 0) items.push({ key: k, qty });
+    }
+    if (items.length === 0) return null;
+    const zone = ps.z;
+    if (!zone || zone === 'town' || zone === 'farm_home') return null;
+    const session = this._sessionById(playerId);
+    const ownerName = (session && session.name) || 'Player';
+    const pile = {
+      lootId: 'dd-' + playerId + '-' + Date.now(),
+      zone,
+      x: ps.x || 0,
+      y: ps.y || 0,
+      coins: 0,
+      skull: null,
+      shard: null,
+      // Null recipients = anyone in zone may claim.  _handleLootPickup
+      // short-circuits the includes() gate on null.
+      recipients: null,
+      shares: {},
+      killerName: ownerName,
+      ts: Date.now(),
+      inventoryClaimed: false,
+      claimedBy: {},
+      isDeathDrop: true,
+      deathItems: items,
+      expiry: Date.now() + this.LOOT_EXPIRY_MS,
+    };
+    if (!this.loot[zone]) this.loot[zone] = [];
+    this.loot[zone].push(pile);
+    this.eventBuffer.push({
+      type: 'loot_drop',
+      payload: { pile: this._serializePile(pile) },
+    });
+    return pile;
   }
 
   _zoneLootForWire(zone) {
@@ -2406,8 +2460,9 @@ export class GameRoom {
     // inventory is single-claim across the pile.
     if (pile.claimedBy[session.id]) return;
 
-    // Recipient gate.
-    if (!pile.recipients.includes(session.id)) return;
+    // Recipient gate -- skipped for death drops (recipients=null means
+    // anyone in zone may claim).
+    if (pile.recipients && !pile.recipients.includes(session.id)) return;
 
     // Range gate -- player must be near the pile per server-tracked
     // position.  Slightly looser than the client's 20 px to absorb
@@ -2417,6 +2472,48 @@ export class GameRoom {
     const dx = ps.x - pile.x;
     const dy = ps.y - pile.y;
     if (dx * dx + dy * dy > this.LOOT_PICKUP_RANGE * this.LOOT_PICKUP_RANGE) return;
+
+    // Death-drop pickup: first picker grabs everything, pile despawns.
+    // Separate code path from monster-kill loot since there are no
+    // shares + coins/skull/shard, just bulk items.
+    if (pile.isDeathDrop) {
+      if (!ps.inventory) ps.inventory = {};
+      const itemsForMe = [];
+      for (const it of (pile.deathItems || [])) {
+        const key = it && it.key;
+        const qty = Math.floor(Number(it && it.qty) || 0);
+        if (!key || qty <= 0) continue;
+        ps.inventory[key] = (ps.inventory[key] || 0) + qty;
+        itemsForMe.push({ key, qty });
+      }
+      pile.claimedBy[session.id] = true;
+      pile.inventoryClaimed = true;
+      this._saveRpg(session.id, ps);
+      const ws = this._wsBySessionId(session.id);
+      if (ws) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'loot_credit',
+            payload: {
+              lootId,
+              zone,
+              coins: 0,
+              skull: null,
+              shard: null,
+              items: itemsForMe,
+              isDeathDrop: true,
+            },
+          }));
+        } catch (e) {}
+        this._sendPlayerState(ws, session.id);
+      }
+      this.eventBuffer.push({
+        type: 'loot_claimed',
+        payload: { lootId, zone, byPlayer: session.id, inventoryClaimedNow: true },
+      });
+      this._despawnLoot(zone, lootId);
+      return;
+    }
 
     // Compute the player's authorized share.
     const share = pile.shares[session.id] || 0;
