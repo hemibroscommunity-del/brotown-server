@@ -2382,9 +2382,13 @@ export class GameRoom {
       coins: 0,
       skull: null,
       shard: null,
-      // Null recipients = anyone in zone may claim.  _handleLootPickup
-      // short-circuits the includes() gate on null.
-      recipients: null,
+      // Recipients = just the dying player.  Keeps the pile in their
+      // own hands (you lose items if you can't make it back in 60 s
+      // instead of someone griefing-grabbing them) AND works with the
+      // existing client recipient-gate semantics on both old and new
+      // builds -- a null/empty recipients list trips the "not yours"
+      // bounce-back on the client filter and pickup never fires.
+      recipients: [playerId],
       shares: {},
       killerName: ownerName,
       ts: Date.now(),
