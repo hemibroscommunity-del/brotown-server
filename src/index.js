@@ -2160,6 +2160,14 @@ export class GameRoom {
     ps.dead = true;
     ps.respawnAt = Date.now() + 5000;
     ps.dmgFromMonster = {};
+    // Drop all general inventory on death (mummy remains, fish, wood,
+    // etc.).  Equipped loadout (weapon / rangedWeapon / staffWeapon /
+    // armor / shield / amulet) and weaponStash are preserved -- only
+    // the consumable/material inventory is wiped.  Coins are untouched
+    // here; the client still applies its own DEATH_GOLD_PENALTY.
+    ps.inventory = {};
+    this._saveRpg(playerId, ps);
+    this._queuePlayerStateFlush(playerId);
     const ws = this._wsBySessionId(playerId);
     if (ws) {
       try {
