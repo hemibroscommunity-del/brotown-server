@@ -1971,9 +1971,15 @@ export class GameRoom {
     ps.dmgFromMonster[monsterId] = (ps.dmgFromMonster[monsterId] || 0) + amount;
   }
 
-  _applyMeleeLifesteal(ps, monsterId) {
+  // slotOverride: if the client passed an explicit slot in monster_damage
+  // (the slot the killing hit was actually struck with), trust that
+  // over ps.activeSlot.  ps.activeSlot only updates when the client
+  // sends set_active_slot, which the desktop slot-select UI skips --
+  // a stale 'ranged' value there silently kills lifesteal for what the
+  // player sees as a melee swing.
+  _applyMeleeLifesteal(ps, monsterId, slotOverride) {
     if (!ps || !monsterId) return 0;
-    const slot = ps.activeSlot || 'melee';
+    const slot = slotOverride || ps.activeSlot || 'melee';
     if (slot !== 'melee') return 0;
     if (!ps.dmgFromMonster) return 0;
     const taken = ps.dmgFromMonster[monsterId] || 0;
@@ -2651,7 +2657,7 @@ export class GameRoom {
   }
 
   _handleMonsterDamage(session, payload) {
-    const { monsterId, zone, dmg, isCrit, element } = payload;
+    const { monsterId, zone, dmg, isCrit, element, slot } = payload;
     if (!monsterId || !zone || !dmg) return;
     const monsters = this.monsters[zone];
     if (!monsters) return;
@@ -2824,7 +2830,10 @@ export class GameRoom {
       // but didn't land the kill get nothing.  Mirrors the client's
       // existing applyMeleeLifesteal (slated for removal once this
       // server path is the source of truth).
-      const refund = this._applyMeleeLifesteal(attackerPs, m.id);
+      // Pass the wire-sent slot through so a desktop slot-select user
+      // whose server-side activeSlot didn't get the set_active_slot
+      // update still gets the heal on a real melee swing.
+      const refund = this._applyMeleeLifesteal(attackerPs, m.id, slot);
       if (refund > 0) {
         const killerWs = this._wsBySessionId(session.id);
         if (killerWs) {
