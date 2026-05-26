@@ -2698,7 +2698,7 @@ export class GameRoom {
           try {
             killerWs.send(JSON.stringify({
               type: 'lifesteal_credit',
-              payload: { monsterId: m.id, refund },
+              payload: { playerId: session.id, monsterId: m.id, refund },
             }));
           } catch (e) {}
         }
