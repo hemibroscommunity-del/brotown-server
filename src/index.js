@@ -133,6 +133,11 @@ export class GameRoom {
     // the picker with their authorized share + any one-of inventory.
     this.loot = {}; // zoneId -> [pile, ...]
     this.LOOT_EXPIRY_MS = 60000;
+    // Death-drop timing: dying player has DEATH_PILE_OWNER_MS alone
+    // to recover their dropped inventory; after that anyone in zone
+    // may grab it; pile despawns entirely at DEATH_PILE_TOTAL_MS.
+    this.DEATH_PILE_OWNER_MS = 60000;
+    this.DEATH_PILE_TOTAL_MS = 120000;
     this.LOOT_PICKUP_RANGE = 30; // px; slightly looser than client's 20 to absorb position lag
     this.SHARD_DROP_RATE = 0.10; // 10% per kill, matches client rollMonsterShard
 
@@ -2352,6 +2357,9 @@ export class GameRoom {
       isDeathDrop: p.isDeathDrop || false,
       deathItems: p.deathItems || null,
       expiry: p.expiry || null,
+      // Death drops are owner-only until ownerOnlyUntil, then free-
+      // for-all until expiry.  Null for monster-kill piles.
+      ownerOnlyUntil: p.ownerOnlyUntil || null,
     };
   }
 
@@ -2382,12 +2390,10 @@ export class GameRoom {
       coins: 0,
       skull: null,
       shard: null,
-      // Recipients = just the dying player.  Keeps the pile in their
-      // own hands (you lose items if you can't make it back in 60 s
-      // instead of someone griefing-grabbing them) AND works with the
-      // existing client recipient-gate semantics on both old and new
-      // builds -- a null/empty recipients list trips the "not yours"
-      // bounce-back on the client filter and pickup never fires.
+      // Recipients = just the dying player for the owner-only window;
+      // after DEATH_PILE_OWNER_MS the server-side _handleLootPickup
+      // and client-side recipient gate both flip to free-for-all so
+      // anyone in zone may claim (driven by ownerOnlyUntil + isDeathDrop).
       recipients: [playerId],
       shares: {},
       killerName: ownerName,
@@ -2396,7 +2402,8 @@ export class GameRoom {
       claimedBy: {},
       isDeathDrop: true,
       deathItems: items,
-      expiry: Date.now() + this.LOOT_EXPIRY_MS,
+      ownerOnlyUntil: Date.now() + this.DEATH_PILE_OWNER_MS,
+      expiry: Date.now() + this.DEATH_PILE_TOTAL_MS,
     };
     if (!this.loot[zone]) this.loot[zone] = [];
     this.loot[zone].push(pile);
@@ -2446,7 +2453,13 @@ export class GameRoom {
       // Walk back-to-front so splice is safe.
       for (let i = list.length - 1; i >= 0; i--) {
         const p = list[i];
-        if (now - p.ts > this.LOOT_EXPIRY_MS) {
+        // Honor pile.expiry if set (death drops use 120 s); else fall
+        // back to the standard ts + LOOT_EXPIRY_MS window for monster
+        // kill piles.
+        const expired = p.expiry
+          ? now > p.expiry
+          : (now - p.ts > this.LOOT_EXPIRY_MS);
+        if (expired) {
           list.splice(i, 1);
           this.eventBuffer.push({
             type: 'loot_despawn',
@@ -2470,9 +2483,14 @@ export class GameRoom {
     // inventory is single-claim across the pile.
     if (pile.claimedBy[session.id]) return;
 
-    // Recipient gate -- skipped for death drops (recipients=null means
-    // anyone in zone may claim).
-    if (pile.recipients && !pile.recipients.includes(session.id)) return;
+    // Recipient gate.  Death drops enforce owner-only until
+    // ownerOnlyUntil, then anyone in zone may claim until expiry.
+    const deathFreeForAll = pile.isDeathDrop
+      && pile.ownerOnlyUntil
+      && Date.now() > pile.ownerOnlyUntil;
+    if (!deathFreeForAll
+        && pile.recipients
+        && !pile.recipients.includes(session.id)) return;
 
     // Range gate -- player must be near the pile per server-tracked
     // position.  Slightly looser than the client's 20 px to absorb
