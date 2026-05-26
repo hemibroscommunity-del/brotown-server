@@ -2835,6 +2835,10 @@ export class GameRoom {
       // update still gets the heal on a real melee swing.
       const refund = this._applyMeleeLifesteal(attackerPs, m.id, slot);
       if (refund > 0) {
+        // Persist the post-heal hp.  Without a fresh _saveRpg the
+        // xpRecipients loop above already wrote the pre-heal hp to
+        // storage, so a reconnect would reload the lower value.
+        this._saveRpg(session.id, attackerPs);
         const killerWs = this._wsBySessionId(session.id);
         if (killerWs) {
           try {
@@ -2843,8 +2847,16 @@ export class GameRoom {
               payload: { playerId: session.id, monsterId: m.id, refund },
             }));
           } catch (e) {}
+          // Push player_state synchronously so the bumped hp lands the
+          // same tick instead of waiting for _flushPendingPlayerStates.
+          // _queuePlayerStateFlush would already coalesce with the
+          // xpRecipients flush above, but that flush captures whatever
+          // is in memory at tick time -- a near-simultaneous damage tick
+          // can drop hp BACK down between this kill and the flush, so
+          // the player sees no visible rise.  Synchronous emit lets the
+          // client receive the heal-augmented hp before any racing tick.
+          this._sendPlayerState(killerWs, session.id);
         }
-        this._queuePlayerStateFlush(session.id);
       }
 
       // Clear contribution tracking for the next life of this monster.
