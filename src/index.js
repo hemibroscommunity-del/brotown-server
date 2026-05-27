@@ -1977,18 +1977,27 @@ export class GameRoom {
   // sends set_active_slot, which the desktop slot-select UI skips --
   // a stale 'ranged' value there silently kills lifesteal for what the
   // player sees as a melee swing.
+  //
+  // Returns { refund, reason }.  reason is one of:
+  //   'ok'           — heal applied, refund > 0
+  //   'no-ps'        — attackerPs missing (player disconnected mid-kill)
+  //   'not-melee'    — slot resolved to ranged/staff (denied by design)
+  //   'no-damage'    — dmgFromMonster map empty (player took no damage from any monster)
+  //   'no-this-mon'  — player took damage but not from this specific monster
+  // Caller can use reason to surface debug info in the lifesteal_credit
+  // event so a "no heal" outcome is diagnosable.
   _applyMeleeLifesteal(ps, monsterId, slotOverride) {
-    if (!ps || !monsterId) return 0;
+    if (!ps || !monsterId) return { refund: 0, reason: 'no-ps' };
     const slot = slotOverride || ps.activeSlot || 'melee';
-    if (slot !== 'melee') return 0;
-    if (!ps.dmgFromMonster) return 0;
+    if (slot !== 'melee') return { refund: 0, reason: 'not-melee' };
+    if (!ps.dmgFromMonster) return { refund: 0, reason: 'no-damage' };
     const taken = ps.dmgFromMonster[monsterId] || 0;
-    if (taken <= 0) return 0;
+    if (taken <= 0) return { refund: 0, reason: 'no-this-mon' };
     const refund = Math.ceil(taken * 0.9);
     const maxHp = ps.maxHp || 100;
     ps.hp = Math.min(maxHp, (ps.hp || 0) + refund);
     delete ps.dmgFromMonster[monsterId];
-    return refund;
+    return { refund, reason: 'ok' };
   }
 
   // Apply stats_update payload to playerState.  Client sends after
@@ -2833,28 +2842,35 @@ export class GameRoom {
       // Pass the wire-sent slot through so a desktop slot-select user
       // whose server-side activeSlot didn't get the set_active_slot
       // update still gets the heal on a real melee swing.
-      const refund = this._applyMeleeLifesteal(attackerPs, m.id, slot);
-      if (refund > 0) {
-        // Persist the post-heal hp.  Without a fresh _saveRpg the
-        // xpRecipients loop above already wrote the pre-heal hp to
-        // storage, so a reconnect would reload the lower value.
-        this._saveRpg(session.id, attackerPs);
-        const killerWs = this._wsBySessionId(session.id);
-        if (killerWs) {
-          try {
-            killerWs.send(JSON.stringify({
-              type: 'lifesteal_credit',
-              payload: { playerId: session.id, monsterId: m.id, refund },
-            }));
-          } catch (e) {}
+      const { refund, reason } = this._applyMeleeLifesteal(attackerPs, m.id, slot);
+      // Emit lifesteal_credit even when refund is 0 so the client can
+      // log the reason and the user can tell whether the gate failed
+      // (vs. the heal landing silently because they were already at
+      // max hp).
+      const killerWs = this._wsBySessionId(session.id);
+      if (killerWs) {
+        try {
+          killerWs.send(JSON.stringify({
+            type: 'lifesteal_credit',
+            payload: {
+              playerId: session.id,
+              monsterId: m.id,
+              refund,
+              reason,
+              // Echo the resolved slot + activeSlot so a stale-state
+              // debug session has the full picture.
+              slot: slot || null,
+              activeSlot: (attackerPs && attackerPs.activeSlot) || null,
+            },
+          }));
+        } catch (e) {}
+        if (refund > 0) {
+          // Persist the post-heal hp.  Without a fresh _saveRpg the
+          // xpRecipients loop above already wrote the pre-heal hp to
+          // storage, so a reconnect would reload the lower value.
+          this._saveRpg(session.id, attackerPs);
           // Push player_state synchronously so the bumped hp lands the
           // same tick instead of waiting for _flushPendingPlayerStates.
-          // _queuePlayerStateFlush would already coalesce with the
-          // xpRecipients flush above, but that flush captures whatever
-          // is in memory at tick time -- a near-simultaneous damage tick
-          // can drop hp BACK down between this kill and the flush, so
-          // the player sees no visible rise.  Synchronous emit lets the
-          // client receive the heal-augmented hp before any racing tick.
           this._sendPlayerState(killerWs, session.id);
         }
       }
