@@ -749,13 +749,16 @@ export class GameRoom {
     const H = zone.h * this.TILE;
     const margin = 8 * this.TILE; // matches client lifeSkills.js inset
     const cfg = this._getZoneNodeConfig(zoneId);
-    const tierLvls = this._getShallowNodeTierLvls();
+    // Entry-level zones pin to tier 1 (the lowest of the shallow set).
+    // _getShallowNodeTierLvls is still defined for future deeper-depth
+    // tiers but the active zones (meadow / hollows / frost) all use
+    // entry-tier nodes only.
     const nodes = [];
     let idx = 0;
     const placeOne = (type) => {
       const x = margin + Math.random() * (W - margin * 2);
       const y = margin + Math.random() * (H - margin * 2);
-      const tierLvl = tierLvls[Math.floor(Math.random() * tierLvls.length)];
+      const tierLvl = 1;
       nodes.push({
         id: 'sn-' + zoneId + '-' + idx,
         nodeType: type,
