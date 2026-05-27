@@ -22,6 +22,38 @@ export default {
       return env.GAME_ROOM.get(env.GAME_ROOM.idFromName(room)).fetch(request);
     }
 
+    // Lobby pick -- scans the numbered room list and returns the first
+    // room under LOBBY_SOFT_CAP, or a fresh room past the scan range
+    // if every existing room is at cap.  Client calls this once before
+    // opening the WebSocket so we don't need ?room=X user input.  An
+    // explicit ?room=X URL query bypasses lobby entirely (escape hatch
+    // for testing / private friend sessions).
+    if (url.pathname === '/api/lobby') {
+      const PREFIX = 'brotown';
+      const SOFT_CAP = 40;       // 10-player headroom under MAX_PLAYERS=50
+      const SCAN_ROOMS = 10;     // existing pool to scan before minting fresh
+      for (let i = 1; i <= SCAN_ROOMS; i++) {
+        const room = PREFIX + '-' + i;
+        try {
+          const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(room));
+          const probe = await stub.fetch(new Request('https://internal/_room_count'));
+          if (probe.ok) {
+            const { count } = await probe.json();
+            if (typeof count === 'number' && count < SOFT_CAP) {
+              return new Response(JSON.stringify({ room, count }), { headers: corsHeaders });
+            }
+          }
+        } catch (e) {
+          // Probe failed (cold start hiccup, network blip) -- skip this
+          // room and try the next.  A room that won't respond shouldn't
+          // block lobby pick.
+        }
+      }
+      // All scanned rooms at/above cap -- mint the next number so new
+      // joiners spill into a fresh DO instead of jamming an existing one.
+      return new Response(JSON.stringify({ room: PREFIX + '-' + (SCAN_ROOMS + 1) }), { headers: corsHeaders });
+    }
+
     if (url.pathname.startsWith('/api/market')) {
       return env.MARKETPLACE.get(env.MARKETPLACE.idFromName('global')).fetch(request);
     }
@@ -2893,6 +2925,15 @@ export class GameRoom {
   }
 
   async fetch(request) {
+    // Internal lobby probe -- outer worker hits this on each scanned
+    // room to read the player count without opening a WebSocket.
+    // Predates the Upgrade check so a non-WS request resolves cleanly.
+    const url = new URL(request.url);
+    if (url.pathname === '/_room_count') {
+      return new Response(JSON.stringify({ count: this.getPlayerCount() }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
     }
