@@ -723,15 +723,20 @@ export class GameRoom {
     return [1, 6]; // eligible tier .lvl values for depth=shallow
   }
 
-  // Per-zone node count + type split — mirrors client lifeSkills.js
-  // spawnGatherNodes() for shallow depth (nodeCount=8: 40% tree, 25%
-  // fish, 35% ore -> 4 / 2 / 2).  Town and farm_home are skipped at
-  // the call sites.
+  // Per-zone node count + type split.  Entry-level resource extraction
+  // is zone-specialized -- one resource type per zone so each life-skill
+  // has its own home base.  Other zones get no nodes until specific
+  // resources are designed for them.
+  //   - meadow:  fishing holes
+  //   - hollows: ore veins (the rock zone)
+  //   - frost:   trees (the snowy zone -- client renders these as pines)
   _getZoneNodeConfig(zoneId) {
-    // Every combat zone gets the same shallow-depth mix today.  Custom
-    // per-zone tuning (e.g. extra fish spots in tidal) can land here
-    // later without touching the client.
-    return { treeCt: 4, fishCt: 2, oreCt: 2 };
+    const ZONE_NODES = {
+      meadow:  { treeCt: 0, fishCt: 6, oreCt: 0 },
+      hollows: { treeCt: 0, fishCt: 0, oreCt: 6 },
+      frost:   { treeCt: 6, fishCt: 0, oreCt: 0 },
+    };
+    return ZONE_NODES[zoneId] || { treeCt: 0, fishCt: 0, oreCt: 0 };
   }
 
   // Spawn the static node layout for a zone.  Positions are randomized
