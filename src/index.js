@@ -2272,12 +2272,16 @@ export class GameRoom {
       const oocMana = (now - (ps.lastDamageAt || 0)) > 2000;
       let changed = false;
 
-      // HP regen disabled -- melee lifesteal (refund 90% of damage taken
-      // on melee kill) and explicit heals (eat_request, cooking recipe
-      // hp buff) are now the only ways to recover hp.  Resting in town
-      // no longer trickles hp back, and the in-combat regen tick is
-      // also gone -- damage stays applied until you kill something or
-      // eat something.
+      // HP regen: fast in safe zones (town / farm_home), off in combat
+      // zones.  Lifesteal + eating remain the only heals while fighting;
+      // walking back to town tops you off in ~7 s so a fresh expedition
+      // doesn't start at the HP you happened to limp home with.
+      if ((ps.z === 'town' || ps.z === 'farm_home') && ps.hp < ps.maxHp) {
+        const heal = Math.max(1, Math.ceil(ps.maxHp * 0.10));
+        const beforeHp = ps.hp;
+        ps.hp = Math.min(ps.maxHp, ps.hp + heal);
+        if (ps.hp !== beforeHp) changed = true;
+      }
 
       // Stamina: shield drain takes priority over regen.  When blocking,
       // drain ~5/tick and auto-release at 0 (mirrors client behavior at
@@ -3212,6 +3216,38 @@ export class GameRoom {
               // Combat zone -- send the new zone's monster + gather +
               // loot state so the client can render them.
               const newMonsters = this._ensureZoneMonsters(ps.z);
+              // Push any monster within the safe entry radius away from
+              // the player's drop-in position so they don't take damage
+              // before they can react.  Mirrors the client's pre-server
+              // logic at BroTown.jsx:5549; without it, the server's
+              // randomly-placed monsters can spawn right on top of the
+              // entry coords.  Also clamps to the playable area so a
+              // monster pushed near the edge doesn't end up out of bounds.
+              const ENTRY_SAFE_RADIUS = 280;
+              const zoneCfg = this._getZoneConfig(ps.z);
+              if (zoneCfg) {
+                const W = zoneCfg.w * this.TILE;
+                const H = zoneCfg.h * this.TILE;
+                const edgePad = 3 * this.TILE;
+                for (const m of newMonsters) {
+                  if (!m.alive) continue;
+                  const mdx = m.x - ps.x;
+                  const mdy = m.y - ps.y;
+                  const md = Math.sqrt(mdx * mdx + mdy * mdy);
+                  if (md > 0 && md < ENTRY_SAFE_RADIUS) {
+                    const k = ENTRY_SAFE_RADIUS / md;
+                    m.x = Math.max(edgePad, Math.min(W - edgePad, ps.x + mdx * k));
+                    m.y = Math.max(edgePad, Math.min(H - edgePad, ps.y + mdy * k));
+                  } else if (md === 0) {
+                    // Spawned exactly on top of player: shove right.
+                    m.x = Math.min(W - edgePad, ps.x + ENTRY_SAFE_RADIUS);
+                  }
+                  // Reset spawnX/Y so respawn doesn't drop them back on
+                  // the entry tile.
+                  m.spawnX = m.x;
+                  m.spawnY = m.y;
+                }
+              }
               ws.send(JSON.stringify({
                 type: 'zone_monsters',
                 zone: ps.z,
