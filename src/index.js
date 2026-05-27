@@ -158,6 +158,25 @@ export class GameRoom {
     this.dirtyNodes = new Set(); // zoneIds with changed node state
     this.NODE_RESPAWN_TIME = 120000; // 2 min — matches client v2.3.30
 
+    // ═══ Resource-extraction validation (client v2.3.229 windowed-swipe) ═══
+    //
+    // Constants mirror src/data/gameSystems.js exactly -- keep in sync.
+    // computeOpenDelay base is gap-driven: tier-lvl gap of +1 stretches
+    // the wait by 1200 ms; -1 compresses by 250 ms; clamped to [2000, 10000].
+    // Jitter ±15% applied per attempt (we use the bounds to validate, not
+    // the same jitter sample the client picked).
+    this.EXTRACT_WINDOW_MS = 1500;
+    this.EXTRACT_OPEN_MIN  = 2000;
+    this.EXTRACT_OPEN_MAX  = 10000;
+    this.EXTRACT_OPEN_BASE = 4000;
+    this.EXTRACT_JITTER    = 0.15;
+    this.EXTRACTION_TIMEOUT_MS = 15000;     // walk-away cancel is silent; sweep stale state after this
+    this.EXTRACTION_GRACE_MS = 250;         // forgiveness on both ends to absorb network jitter
+    this.SWIPE_FP_CAP_PER_SESSION = 100;    // ring-buffer the fp samples for offline analysis
+    this.LATENCY_CAP_PER_SESSION = 200;     // ring-buffer the open->swipe latencies for stats
+    // sessionId -> { nodeId, zone, skill, startedAt, skillLevel, nodeTier, openDelayBase }
+    this.extractions = {};
+
     // Server-authoritative ground loot.  Worker owns the canonical pile
     // list per zone; clients render from broadcasts and send pickup
     // requests via loot_pickup.  Server validates each pickup (range,
@@ -1717,9 +1736,58 @@ export class GameRoom {
     if (ws) this._sendPlayerState(ws, session.id);
   }
 
+  // Mirror of computeOpenDelay() in src/data/gameSystems.js, sans the
+  // jitter sample -- returns the BASE delay so the validator can bound
+  // the per-attempt window by base * (1 ± EXTRACT_JITTER).
+  _computeOpenDelayBase(skillLevel, nodeTier) {
+    const lvl = Number(skillLevel) || 0;
+    const tier = Number(nodeTier) || 1;
+    const gap = tier - lvl;
+    let base;
+    if (gap > 0) base = this.EXTRACT_OPEN_BASE + gap * 1200;
+    else if (gap < 0) base = this.EXTRACT_OPEN_BASE + gap * 250;
+    else base = this.EXTRACT_OPEN_BASE;
+    return Math.max(this.EXTRACT_OPEN_MIN, Math.min(this.EXTRACT_OPEN_MAX, base));
+  }
+
+  // Sweep extraction entries past EXTRACTION_TIMEOUT_MS.  Walk-away
+  // cancel is silent on the client -- the player just stops getting the
+  // swipe cue; the server cleans up so the map doesn't grow unbounded.
+  _sweepStaleExtractions(nowMs) {
+    const cutoff = (nowMs || Date.now()) - this.EXTRACTION_TIMEOUT_MS;
+    for (const sid of Object.keys(this.extractions)) {
+      const e = this.extractions[sid];
+      if (!e || e.startedAt < cutoff) delete this.extractions[sid];
+    }
+  }
+
+  // Client sent extraction_start { nodeId, zone, skill } -- record what
+  // we need to validate the eventual node_strike (the swipe-landed
+  // event).  Server also captures skillLevel + nodeTier at the start so
+  // a mid-attempt level-up doesn't shift the expected window.
+  _handleExtractionStart(session, payload) {
+    if (!session || !session.id) return;
+    const { nodeId, zone, skill } = payload || {};
+    if (!nodeId || !zone || !skill) return;
+    const ps = this.playerState[session.id];
+    if (!ps) return;
+    const list = this.nodes[zone];
+    if (!list) return;
+    const n = list.find((x) => x.id === nodeId);
+    if (!n || !n.alive) return;
+    const skillLevel = (ps.lifeSkills && ps.lifeSkills[skill] && ps.lifeSkills[skill].level) || 0;
+    const nodeTier = n.tierLvl || 1;
+    this.extractions[session.id] = {
+      nodeId, zone, skill,
+      startedAt: Date.now(),
+      skillLevel, nodeTier,
+      openDelayBase: this._computeOpenDelayBase(skillLevel, nodeTier),
+    };
+  }
+
   _handleNodeStrike(session, payload) {
     if (!session || !session.id) return;
-    const { id, zone, accuracy } = payload || {};
+    const { id, zone, accuracy, swipeFp } = payload || {};
     if (!id || !zone) return;
     const list = this.nodes[zone];
     if (!list) return;
@@ -1734,9 +1802,86 @@ export class GameRoom {
     const dy = ps.y - n.y;
     if (dx * dx + dy * dy > this.LOOT_PICKUP_RANGE * this.LOOT_PICKUP_RANGE) return;
 
+    // ═══ Timing validation against the recorded extraction_start ═══
+    //
+    // Per v2.3.229 hand-off: the windowed-swipe loop tells us when the
+    // attempt began so we can compute the same open-delay window the
+    // client did.  If the strike arrives BEFORE the earliest jitter
+    // bound, it's a cheat (no human swiped that fast).  If it arrives
+    // AFTER the latest bound + window, it's a miss regardless of what
+    // accuracy the client claimed.
+    //
+    // Permissive on missing extraction state (DO restart mid-attempt,
+    // legacy clients): treat as a pre-v2.3.229 strike, skip the window
+    // check, fall through to existing logic.  We log a counter for
+    // visibility but don't reject.
+    const now = Date.now();
+    const ex = this.extractions[session.id];
+    let coercedAccuracy = accuracy || 'good';
+    let openLatencyMs = null;
+    if (ex && ex.nodeId === id && ex.zone === zone) {
+      const jitterLo = 1 - this.EXTRACT_JITTER;
+      const jitterHi = 1 + this.EXTRACT_JITTER;
+      const earliestOpen = ex.startedAt + Math.floor(ex.openDelayBase * jitterLo) - this.EXTRACTION_GRACE_MS;
+      const latestClose  = ex.startedAt + Math.ceil(ex.openDelayBase * jitterHi) + this.EXTRACT_WINDOW_MS + this.EXTRACTION_GRACE_MS;
+      if (now < earliestOpen) {
+        // Too early -- impossibly fast swipe.  Drop the strike, leave
+        // the node alive, leave extraction state so a legit follow-up
+        // can still complete.
+        if (!session._extractionRejects) session._extractionRejects = 0;
+        session._extractionRejects++;
+        return;
+      }
+      if (now > latestClose) {
+        // Past the window -- whatever the client said, it was a miss.
+        coercedAccuracy = 'miss';
+      }
+      // Latency telemetry: ms from earliest-possible-open to swipe.
+      openLatencyMs = now - earliestOpen;
+    } else if (!ex) {
+      if (!session._extractionMissing) session._extractionMissing = 0;
+      session._extractionMissing++;
+    }
+    // Extraction resolved (success or timeout) -- clear the state so a
+    // fresh tap doesn't reuse stale timing.
+    delete this.extractions[session.id];
+
+    // swipeFp telemetry -- ring-buffered per session for offline
+    // anomaly review.  Not used for ban decisions per spec.
+    if (swipeFp && typeof swipeFp === 'object' && coercedAccuracy === 'good') {
+      if (!session._swipeFps) session._swipeFps = [];
+      const fp = {
+        ts: now,
+        nodeId: id,
+        len: Number(swipeFp.len) || 0,
+        ent: Number(swipeFp.ent) || 0,
+        dur: Number(swipeFp.dur) || 0,
+        latency: openLatencyMs,
+      };
+      session._swipeFps.push(fp);
+      if (session._swipeFps.length > this.SWIPE_FP_CAP_PER_SESSION) {
+        session._swipeFps.shift();
+      }
+    }
+    if (openLatencyMs != null && coercedAccuracy === 'good') {
+      if (!session._extractionLatencies) session._extractionLatencies = [];
+      session._extractionLatencies.push(openLatencyMs);
+      if (session._extractionLatencies.length > this.LATENCY_CAP_PER_SESSION) {
+        session._extractionLatencies.shift();
+      }
+    }
+
+    // Deplete the node + broadcast respawn regardless of outcome (the
+    // client already consumed it visually on miss-timeout too).  Same
+    // respawn timer either way.
     n.alive = false;
     n.respawnAt = Date.now() + this.NODE_RESPAWN_TIME;
     this.dirtyNodes.add(zone);
+
+    // Miss path: no inventory, no XP, no shard, no harvest_credit.
+    // Client already knows it missed (it sent accuracy:'miss') so the
+    // node delta broadcast is enough.
+    if (coercedAccuracy === 'miss') return;
 
     /* Apply the inventory grant server-side and persist.  Client used
        to do this in _applyFishingReward / _applyWoodReward /
@@ -3404,10 +3549,23 @@ export class GameRoom {
         }
         break;
 
+      case 'extraction_start':
+        // Client v2.3.229+ -- player tapped a node to begin the
+        // windowed-swipe extraction loop.  Server records timing so
+        // the eventual node_strike can be validated against the
+        // expected open-delay window (see _handleExtractionStart +
+        // _handleNodeStrike).
+        if (session.id) {
+          this._handleExtractionStart(session, msg.payload || msg);
+        }
+        break;
+
       case 'node_strike':
-        // Client reports a successful harvest action on a gather node.
-        // The minigame already gates this on success (mining miss does
-        // NOT send), so we just validate and apply.
+        // Client reports the swipe-landed event for an extraction.
+        // Server validates timing vs. extraction_start record, treats
+        // strikes past the window-close as miss regardless of the
+        // accuracy the client claimed, drops too-early strikes as
+        // cheats, otherwise applies the existing harvest reward flow.
         if (session.id) {
           this._handleNodeStrike(session, msg.payload || msg);
         }
@@ -3701,6 +3859,7 @@ export class GameRoom {
       if (this.playerState[session.id]) this.playerState[session.id].disconnected = true;
       delete this.playerState[session.id];
       delete this.stateHistory[session.id];
+      delete this.extractions[session.id];
       this.dirtyPlayers.delete(session.id);
       this.broadcastAll({ type: 'player_leave', id: session.id });
       this.broadcastAll({ type: 'player_count', count: this.getPlayerCount() - 1 });
@@ -3740,6 +3899,11 @@ export class GameRoom {
       // Loot pile expiry tick -- piles older than LOOT_EXPIRY_MS get
       // despawned with a broadcast event so clients drop them too.
       this._tickLoot();
+
+      // Extraction state sweep -- walk-away cancel is silent on the
+      // client so any extraction_start without a matching node_strike
+      // sits in this.extractions until cleaned here.
+      this._sweepStaleExtractions(Date.now());
 
       // Player respawn tick — flip dying=>alive when respawnAt elapses.
       // Cheap; iterates active player entries.
