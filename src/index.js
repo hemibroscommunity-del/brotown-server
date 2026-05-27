@@ -473,14 +473,16 @@ export class GameRoom {
           }
         }
 
-        // Knockback freeze (paired with _handleMonsterDamage shove).
-        // Skip BOTH movement + attack while _kbUntil is in the future
-        // so the bounce reads cleanly to watchers and the monster
-        // doesn't immediately step back into its target.  Position
-        // already broadcast via dirtyMonsters from the hit handler.
-        if (m._kbUntil && now < m._kbUntil) {
-          continue;
-        }
+        // Knockback freeze removed -- the 200 ms AI lockout combined
+        // with monster speed (~22 px/sec) meant the 30-60 px shove
+        // pushed the monster out of the 45 px attack range and it
+        // couldn't catch back up before the player's next swing
+        // (600 ms cd), so dmgFromMonster[m.id] never accumulated and
+        // _applyMeleeLifesteal returned reason:'no-this-mon' on every
+        // kill -- lifesteal silently broke.  The position shove still
+        // happens in _handleMonsterDamage; the monster now resumes
+        // chase immediately, so the visual bounce is briefer but
+        // monsters can re-engage and land hits between swings.
 
         // Find nearest player for aggro.  If the monster has a recent
         // sticky-aggro override (someone shot it with a bow, etc.),
@@ -3007,13 +3009,19 @@ export class GameRoom {
     m._aggroOverrideUntil = Date.now() + 10000;
 
     // Knockback (client v2.3.222+).  Push the monster directly away
-    // from the attacker by kbForce px; freeze AI movement for 200 ms
-    // (_tickMonsters skips position updates while _kbUntil > now) so
-    // the bounce sticks instead of being immediately overwritten by
-    // chase movement.  Force ramps with hit type: 60 on special (was
-    // 180, reduced 66% per user feedback the bounce was too far for
-    // melee follow-up), 45 on crit, 30 otherwise.  Clamped to zone
-    // bounds so a corner-shove doesn't fling the monster off the map.
+    // from the attacker by kbForce px.  Force ramps with hit type:
+    // 60 on special (was 180, reduced 66% per user request), 45 on
+    // crit, 30 otherwise.  Clamped to zone bounds so a corner-shove
+    // doesn't fling the monster off the map.
+    //
+    // No AI freeze: the 200 ms _kbUntil lockout used to prevent the
+    // monster from chasing back, but combined with monster speed
+    // (~22 px/sec) and the player swing cooldown (600 ms), the shove
+    // pushed monsters out of the 45 px attack range and they never
+    // landed hits between swings -- dmgFromMonster stayed at 0 and
+    // lifesteal silently broke.  Monster now resumes chase
+    // immediately; visual bounce is briefer but the damage economy
+    // works.
     if (attackerPs) {
       const kbForce = payload.special ? 60 : (isCrit ? 45 : 30);
       const kbAng = Math.atan2(m.y - attackerPs.y, m.x - attackerPs.x);
@@ -3027,7 +3035,6 @@ export class GameRoom {
         m.x = Math.max(edgePad, Math.min(W - edgePad, m.x));
         m.y = Math.max(edgePad, Math.min(H - edgePad, m.y));
       }
-      m._kbUntil = Date.now() + 200;
     }
 
     this.dirtyMonsters.add(zone);
