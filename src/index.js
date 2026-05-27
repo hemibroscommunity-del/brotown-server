@@ -454,6 +454,15 @@ export class GameRoom {
           }
         }
 
+        // Knockback freeze (paired with _handleMonsterDamage shove).
+        // Skip BOTH movement + attack while _kbUntil is in the future
+        // so the bounce reads cleanly to watchers and the monster
+        // doesn't immediately step back into its target.  Position
+        // already broadcast via dirtyMonsters from the hit handler.
+        if (m._kbUntil && now < m._kbUntil) {
+          continue;
+        }
+
         // Find nearest player for aggro.  If the monster has a recent
         // sticky-aggro override (someone shot it with a bow, etc.),
         // prefer that target even if they're outside proximity range.
@@ -2748,6 +2757,29 @@ export class GameRoom {
     // choosing a target.
     m._aggroOverrideTarget = session.id;
     m._aggroOverrideUntil = Date.now() + 10000;
+
+    // Knockback (client v2.3.222+).  Push the monster directly away
+    // from the attacker by kbForce px; freeze AI movement for 200 ms
+    // (_tickMonsters skips position updates while _kbUntil > now) so
+    // the bounce sticks instead of being immediately overwritten by
+    // chase movement.  Force ramps with hit type: 180 on special, 45
+    // on crit, 30 otherwise.  Clamped to zone bounds so a corner-shove
+    // doesn't fling the monster off the map.
+    if (attackerPs) {
+      const kbForce = payload.special ? 180 : (isCrit ? 45 : 30);
+      const kbAng = Math.atan2(m.y - attackerPs.y, m.x - attackerPs.x);
+      m.x += Math.cos(kbAng) * kbForce;
+      m.y += Math.sin(kbAng) * kbForce;
+      const zoneCfg = this._getZoneConfig(zone);
+      if (zoneCfg) {
+        const W = zoneCfg.w * this.TILE;
+        const H = zoneCfg.h * this.TILE;
+        const edgePad = this.TILE;
+        m.x = Math.max(edgePad, Math.min(W - edgePad, m.x));
+        m.y = Math.max(edgePad, Math.min(H - edgePad, m.y));
+      }
+      m._kbUntil = Date.now() + 200;
+    }
 
     this.dirtyMonsters.add(zone);
 
