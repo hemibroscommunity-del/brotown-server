@@ -191,15 +191,23 @@ export class GameRoom {
   // values were spawning monsters off the client's map.  Level
   // ranges flattened to [1,10] across the board to match the client.
   _getZoneConfig(zoneId) {
+    // Emoji-only archetypes (brute/swarm/sentinel/volatile/stalker/hexer
+    // in zones without a sprite-backed variant) stripped per user
+    // request -- they'll be re-added one by one as proper monsters
+    // ship.  Kept: anything that resolves to a real sprite on the
+    // client renderer.  Snowman/fodder are always sprite-backed;
+    // brute in hollows -> rockmonster sprite, brute in tidal -> fishman
+    // sprite (via client ZONE_VARIANT_MAP); sky remaps every archetype
+    // to mummy so the existing stalker/hexer/volatile mix is preserved.
     const ZONES = {
       meadow:  { w:32, h:32, level:[1,10], element:null,    spawns:[{arch:'fodder',count:10}] },
-      ember:   { w:32, h:32, level:[1,10], element:'flame', spawns:[{arch:'fodder',count:6},{arch:'brute',count:3},{arch:'volatile',count:4}] },
-      mist:    { w:32, h:32, level:[1,10], element:'venom', spawns:[{arch:'swarm',count:5},{arch:'stalker',count:3},{arch:'hexer',count:3}] },
+      ember:   { w:32, h:32, level:[1,10], element:'flame', spawns:[{arch:'fodder',count:6}] },
+      mist:    { w:32, h:32, level:[1,10], element:'venom', spawns:[] },
       frost:   { w:32, h:32, level:[1,10], element:'frost', spawns:[{arch:'snowman',count:4}] },
-      thunder: { w:32, h:32, level:[1,10], element:'storm', spawns:[{arch:'fodder',count:6},{arch:'volatile',count:4},{arch:'stalker',count:3}] },
-      hollows: { w:32, h:32, level:[1,10], element:'stone', spawns:[{arch:'brute',count:4},{arch:'sentinel',count:3},{arch:'swarm',count:4}] },
+      thunder: { w:32, h:32, level:[1,10], element:'storm', spawns:[{arch:'fodder',count:6}] },
+      hollows: { w:32, h:32, level:[1,10], element:'stone', spawns:[{arch:'brute',count:4}] },
       sky:     { w:32, h:32, level:[1,10], element:'wind',  spawns:[{arch:'stalker',count:4},{arch:'hexer',count:3},{arch:'volatile',count:3}] },
-      tidal:   { w:32, h:32, level:[1,10], element:'water', spawns:[{arch:'swarm',count:4},{arch:'hexer',count:4},{arch:'brute',count:3}] },
+      tidal:   { w:32, h:32, level:[1,10], element:'water', spawns:[{arch:'brute',count:3}] },
     };
     return ZONES[zoneId] || null;
   }
