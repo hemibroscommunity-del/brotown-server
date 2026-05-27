@@ -2340,6 +2340,33 @@ export class GameRoom {
         }
       }
     }
+    // Armor swap routes through stats_update (not equip_request) because
+    // armor lives in a client-only armorStash and the popup mutates it
+    // locally before pushing.  Worker accepts the new armor object (or
+    // null on unequip), clamps tierMult defensively, recomputes maxHp.
+    // Without this, the worker's ps.armor stays stale, its echoed
+    // player_state re-applies the old armor on the client, and the
+    // local unequip silently undoes itself.
+    if ('armor' in payload) {
+      const incoming = payload.armor;
+      let newArmor = null;
+      if (incoming && typeof incoming === 'object') {
+        // Shallow copy + clamp tierMult.  Mirror the cap from _armorHp
+        // so a forged blob with tierMult: 999 can't inflate maxHp.
+        newArmor = { ...incoming };
+        if (typeof newArmor.tierMult === 'number') {
+          newArmor.tierMult = Math.max(0, Math.min(8, newArmor.tierMult));
+        }
+      }
+      // JSON-compare so an identical re-send doesn't trigger spurious
+      // recompute + flush.
+      const oldSig = ps.armor ? JSON.stringify(ps.armor) : 'null';
+      const newSig = newArmor ? JSON.stringify(newArmor) : 'null';
+      if (oldSig !== newSig) {
+        ps.armor = newArmor;
+        statsChanged = true;
+      }
+    }
     if (statsChanged) {
       this._recomputeMaxes(ps);
     }
