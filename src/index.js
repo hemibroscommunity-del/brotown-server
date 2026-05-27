@@ -620,8 +620,13 @@ export class GameRoom {
             // entirely while shielded), but pass !blocking to be
             // defensive in case the path changes.
             const targetPs = this.playerState[nearest.id];
-            const dmgTaken = this._applyDamage(targetPs, m.dmg, false);
-            this._trackMonsterDamage(targetPs, m.id, dmgTaken);
+            const dmgResult = this._applyDamage(targetPs, m.dmg, false);
+            const dmgTaken = dmgResult.dmgTaken;
+            // Don't credit lifesteal damage on a dodge -- nothing to
+            // refund since no HP was taken.
+            if (!dmgResult.dodged) {
+              this._trackMonsterDamage(targetPs, m.id, dmgTaken);
+            }
             this.eventBuffer.push({
               type: 'monster_attack',
               payload: {
@@ -629,6 +634,7 @@ export class GameRoom {
                 targetId: nearest.id,
                 dmg: m.dmg,
                 dmgTaken,
+                dodged: dmgResult.dodged,
                 zone: zoneId,
                 attackerX: m.x,
                 attackerY: m.y,
@@ -1467,6 +1473,10 @@ export class GameRoom {
       ps.weaponStash.push(current);
     }
     ps[slot] = null;
+    // Recompute pool maxes when armor changes -- per the T1/T2 stat
+    // redesign spec, armor folds into maxHp via _armorHp.  Cheap call;
+    // covers future armor-affecting equipment too.
+    if (slot === 'armor') this._recomputeMaxes(ps);
     this._saveRpg(session.id, ps);
     const ws = this._wsBySessionId(session.id);
     if (ws) this._sendPlayerState(ws, session.id);
@@ -1503,6 +1513,8 @@ export class GameRoom {
     if (ps.weaponStash.length > this.WEAPON_STASH_CAP) {
       ps.weaponStash.length = this.WEAPON_STASH_CAP;
     }
+    // Armor swap changes maxHp via _armorHp; recompute pool maxes.
+    if (slot === 'armor') this._recomputeMaxes(ps);
     this._saveRpg(session.id, ps);
     const ws = this._wsBySessionId(session.id);
     if (ws) this._sendPlayerState(ws, session.id);
@@ -2137,28 +2149,46 @@ export class GameRoom {
   // ═══ HP store + damage application (server-authoritative) ═══
   //
   // Server owns current hp; clamps to [0, maxHp].  Damage flows through
-  // _applyDamage which mirrors the client formula at BroTown.jsx:2655.
-  // Defense (def) + amulet hpRegen + restoration are session-only fields
-  // pushed by the client via stats_update whenever recalcDerived runs
-  // (equipment / stat-allocation / level change).  Cheater claiming
-  // def=999 makes themselves tanky, but they're a separate cheat
-  // surface from "infinite-heal R.hp = 99999" which this slice closes.
+  // Per docs/specs/t1-t2-stat-redesign-server.md:
+  //   - Phase 1: `def` reduction retired -- armor now folds into maxHp
+  //     via _armorHp, no per-hit damage reduction.  Resist cooking buff
+  //     still applies (separate mechanic).
+  //   - Phase 4: Agility rolls a per-hit passive dodge, capped at 30%.
+  //     A successful roll zeros the hit; the caller emits a dodged: true
+  //     event so the client can render the popup.
+  //   - Phase 2: Full block invuln stays for the monster→player path
+  //     (caller short-circuits when blocking) and is enforced here via
+  //     isBlock=true (PvP partial-block path callers can opt in).
+  //
+  // Returns { dmgTaken, dodged } -- dmgTaken is 0 for both block and
+  // dodge, dodged disambiguates so the caller can route to the right
+  // popup.
   _applyDamage(ps, rawDmg, isBlock) {
-    if (!ps) return 0;
-    const def = ps.def || 0;
+    if (!ps) return { dmgTaken: 0, dodged: false };
     const r = Math.max(1, Math.round(rawDmg || 0));
-    let dmgTaken = isBlock ? 0 : Math.max(1, Math.ceil(r - def * 0.3));
+    if (isBlock) {
+      ps.lastDamageAt = Date.now();
+      return { dmgTaken: 0, dodged: false };
+    }
+    // Phase 4: Agility passive dodge roll.  Cap 30% so pure-Agility
+    // builds still eat ~70% of hits.
+    const dodgePct = Math.min((ps.agility || 0) * 0.0008, 0.30);
+    if (Math.random() < dodgePct) {
+      ps.lastDamageAt = Date.now();
+      return { dmgTaken: 0, dodged: true };
+    }
+    let dmgTaken = Math.max(1, r);  // def reduction removed (Phase 1)
     // Resist buff (cooking recipe with buff:'resist', power 0.05 = 5%
     // reduction).  Cooking recipe power values are stored as the
     // fractional reduction; mirror the client's intent here.
-    if (dmgTaken > 0 && this._buffActive(ps, 'resist')) {
+    if (this._buffActive(ps, 'resist')) {
       dmgTaken = Math.max(1, Math.ceil(dmgTaken * (1 - 0.05)));
     }
     if (typeof ps.maxHp !== 'number') ps.maxHp = 100;
     if (typeof ps.hp !== 'number') ps.hp = ps.maxHp;
     ps.hp = Math.max(0, ps.hp - dmgTaken);
     ps.lastDamageAt = Date.now();
-    return dmgTaken;
+    return { dmgTaken, dodged: false };
   }
 
   // ═══ Melee lifesteal (per docs/specs/lifesteal-server.md) ═══
@@ -2237,6 +2267,20 @@ export class GameRoom {
     return 100 + ((level || 1) - 1) * 12 + (vitality || 0) * 10;
   }
 
+  // Armor HP contribution -- mirrors getArmorHp() in
+  // src/data/gameSystems.js per docs/specs/t1-t2-stat-redesign-server.md.
+  // Phase 1: armor went from damage-reduction (def) to flat-HP.
+  // tierMult is clamped to a defensive ceiling (8) so a forged-shape
+  // armor with `tierMult: 999` can't inflate maxHp out of bounds.
+  _armorHp(armor, vitality) {
+    if (!armor) return 0;
+    const ARMOR_HP_BASE = 20;
+    const ARMOR_TIER_MULT_CAP = 8;  // legit armor tops out around 6×
+    const tmRaw = (typeof armor.tierMult === 'number' && armor.tierMult > 0) ? armor.tierMult : 1.0;
+    const tm = Math.min(ARMOR_TIER_MULT_CAP, tmRaw);
+    return Math.floor(ARMOR_HP_BASE * tm * (1 + (vitality || 0) * 0.01));
+  }
+
   _calcMaxStamina(endurance) {
     return Math.floor(100 + (endurance || 0) * 3);
   }
@@ -2251,7 +2295,7 @@ export class GameRoom {
     const oldMaxHp = ps.maxHp || 100;
     const oldMaxStam = ps.maxStamina || 100;
     const oldMaxMana = ps.maxMana || 100;
-    ps.maxHp = this._calcMaxHp(lvl, ps.vitality || 0);
+    ps.maxHp = this._calcMaxHp(lvl, ps.vitality || 0) + this._armorHp(ps.armor, ps.vitality || 0);
     ps.maxStamina = this._calcMaxStamina(ps.endurance || 0);
     ps.maxMana = this._calcMaxMana(ps.mind || 0);
     // Clamp current values into the new ranges.
@@ -2268,15 +2312,28 @@ export class GameRoom {
     const ps = this.playerState[session.id];
     if (!ps) return;
     const lvl = ps.level || 1;
-    // Raw stats: accept client value, clamp to per-level cap.  Server
-    // computes its own max values from these and ignores any maxHp /
-    // maxStamina / maxMana the client tries to push.
-    const RAW_STATS = ['power', 'vitality', 'endurance', 'agility', 'mind',
-      'ferocity', 'elementalMastery', 'fortification', 'restoration', 'influence'];
+    // Raw stats: accept client value, clamp to bounds.  T1 stats use
+    // the per-level cap (max(20, level*10+20)) since they grow via
+    // use-training.  T2 stats are allocated from the unspentT2 pool
+    // and per the T1/T2 stat redesign spec are capped at 99 regardless
+    // of level.  Server computes its own pool maxes from these and
+    // ignores any maxHp / maxStamina / maxMana the client tries to push.
+    const T1_STATS = ['power', 'vitality', 'endurance', 'agility', 'mind'];
+    const T2_STATS = ['ferocity', 'elementalMastery', 'fortification', 'restoration', 'influence'];
+    const T2_CAP = 99;
     let statsChanged = false;
-    for (const s of RAW_STATS) {
+    for (const s of T1_STATS) {
       if (typeof payload[s] === 'number') {
         const clamped = this._clampStat(payload[s], lvl);
+        if (ps[s] !== clamped) {
+          ps[s] = clamped;
+          statsChanged = true;
+        }
+      }
+    }
+    for (const s of T2_STATS) {
+      if (typeof payload[s] === 'number') {
+        const clamped = Math.max(0, Math.min(T2_CAP, Math.floor(payload[s])));
         if (ps[s] !== clamped) {
           ps[s] = clamped;
           statsChanged = true;
@@ -2492,7 +2549,9 @@ export class GameRoom {
         } else if (ps.stamina < ps.maxStamina) {
           const stAmuletMult = 1 + (ps.amuletStaminaRegen || 0) / 100;
           const stRestMult = 1 + (ps.restoration || 0) * 0.001;
-          const stHeal = Math.max(1, Math.ceil(7 * stAmuletMult * stRestMult));
+          // Phase 2 of the T1/T2 spec: Endurance multiplies stamina regen.
+          const stEndMult = 1 + (ps.endurance || 0) * 0.002;
+          const stHeal = Math.max(1, Math.ceil(7 * stAmuletMult * stRestMult * stEndMult));
           const beforeSt = ps.stamina;
           ps.stamina = Math.min(ps.maxStamina, ps.stamina + stHeal);
           if (ps.stamina !== beforeSt) changed = true;
@@ -2500,12 +2559,14 @@ export class GameRoom {
       }
 
       // Mana.  manaBuff (1.3x regen mult) layered on top of restoration.
+      // Phase 4b of the T1/T2 spec: Mind also multiplies mana regen.
       const manaBuffActive = this._buffActive(ps, 'mana');
       if (typeof ps.maxMana === 'number' && typeof ps.mana === 'number' && ps.mana < ps.maxMana) {
         const restMult = 1 + (ps.restoration || 0) * 0.001;
         const buffMult = manaBuffActive ? 1.3 : 1.0;
+        const mindMult = 1 + (ps.mind || 0) * 0.001;
         const rate = oocMana ? 0.018 : 0.007;
-        const manaHeal = Math.max(1, Math.ceil(ps.maxMana * rate * restMult * buffMult));
+        const manaHeal = Math.max(1, Math.ceil(ps.maxMana * rate * restMult * buffMult * mindMult));
         const beforeMn = ps.mana;
         ps.mana = Math.min(ps.maxMana, ps.mana + manaHeal);
         if (ps.mana !== beforeMn) changed = true;
@@ -2850,25 +2911,31 @@ export class GameRoom {
   // Multiplied by crit cap (1.75 + ferocity * 0.0008) and a generous
   // 5x "combo + status + amulet + lunge" boost to cover the legit
   // upper bound without rejecting real hits.
-  _maxWeaponDmg(ps) {
+  _maxWeaponDmg(ps, isSpecial) {
     if (!ps) return 0;
     const candidates = [ps.weapon, ps.rangedWeapon, ps.staffWeapon].filter(Boolean);
     if (candidates.length === 0) return 30; // fists fallback
     let max = 0;
-    const power = ps.power || 0;
+    // Phase 4a of the T1/T2 spec: Mind scales special attacks; Power
+    // still scales normal swings.
+    const statBonus = isSpecial ? ((ps.mind || 0) * 0.8) : ((ps.power || 0) * 0.8);
     for (const w of candidates) {
-      const base = (this._weaponBase(w.type) + power * 0.8) * (w.tierMult || 1);
+      const base = (this._weaponBase(w.type) + statBonus) * (w.tierMult || 1);
       if (base > max) max = base;
     }
     return max;
   }
 
-  _maxDmgForAttacker(ps) {
+  _maxDmgForAttacker(ps, isSpecial) {
     if (!ps) return 100;
-    const maxWpn = this._maxWeaponDmg(ps);
-    const critMult = 1.75 + (ps.ferocity || 0) * 0.0008;
+    const maxWpn = this._maxWeaponDmg(ps, isSpecial);
+    // Phase 3: crit damage scales on Power AND Ferocity (Power first).
+    const critMult = 1.5 + (ps.power || 0) * 0.001 + (ps.ferocity || 0) * 0.0008;
     const comboBoost = 5; // covers combo + status amplifier + amulet elemDmg + lunge mult
-    return Math.max(100, Math.ceil(maxWpn * critMult * comboBoost));
+    // SPECIAL_ATK_MULT = 2.0 applied client-side; double the cap on
+    // special hits so they don't get rejected as too-high.
+    const specialMult = isSpecial ? 2.0 : 1.0;
+    return Math.max(100, Math.ceil(maxWpn * critMult * comboBoost * specialMult));
   }
 
   _handleMonsterDamage(session, payload) {
@@ -2885,9 +2952,10 @@ export class GameRoom {
     // Also clamp the incoming value to the per-level cap so a cheater
     // can't claim 99999 damage to one-shot tough monsters.
     const attackerPs = this.playerState[session.id];
-    // Weapon-aware cap (slice 16): replaces level-only with formula
-    // computed from server-tracked weapon + power + ferocity.
-    const dmgCap = this._maxDmgForAttacker(attackerPs);
+    // Weapon-aware cap (slice 16, refreshed for T1/T2 spec): now
+    // accepts isSpecial so special-attack damage (which scales on
+    // Mind + 2x SPECIAL_ATK_MULT per Phase 4a) doesn't get rejected.
+    const dmgCap = this._maxDmgForAttacker(attackerPs, !!payload.special);
     const rawDmg = Math.max(1, Math.min(dmgCap, Math.round(dmg)));
     const actualDmg = Math.min(rawDmg, Math.max(0, m.hp));
     // Subtract actualDmg (capped at remaining hp) so m.hp doesn't go
@@ -3775,8 +3843,9 @@ export class GameRoom {
     const angle = payload.angle || 0;
     // Weapon-aware cap (slice 16) -- mirrors monster_damage cap above.
     // Server now owns the weapon table so the bound is tighter than
-    // the previous level-only formula.
-    const dmgCap = this._maxDmgForAttacker(attackerPs);
+    // the previous level-only formula.  Pass payload.special if the
+    // PvP attack is a swipe so the Mind-scaled cap applies.
+    const dmgCap = this._maxDmgForAttacker(attackerPs, !!payload.special);
     const dmgBase = Math.max(1, Math.min(dmgCap, payload.dmgBase || 10));
     const critChance = Math.max(0, Math.min(100, payload.critChance || 0));
 
@@ -3816,14 +3885,13 @@ export class GameRoom {
       // Crit roll
       const isCrit = Math.random() * 100 < critChance;
 
-      // Apply HP damage server-side.  Mirrors the client formula at
-      // BroTown.jsx:3029-3035: rawDmg = dmgBase * (crit ? 1.5 : 1) *
-      // (blocked ? 0.25 : 1).  We apply via _applyDamage which handles
-      // the def * 0.3 reduction.  Pass isBlock=false so blocked just
-      // scales the raw dmg (matches client's 0.25× partial-block),
-      // not a full 0-dmg server block.
-      const rawDmg = dmgBase * (isCrit ? 1.5 : 1) * (blocked ? 0.25 : 1);
-      const dmgTaken = this._applyDamage(targetPs, rawDmg, false);
+      // Apply HP damage server-side.  Per Phase 2 of the T1/T2 spec,
+      // a blocked hit is full invuln (was 0.25× partial), so pass
+      // isBlock=true straight through.  Phase 4 dodge rolls inside
+      // _applyDamage independently of block.
+      const rawDmg = dmgBase * (isCrit ? 1.5 : 1);
+      const dmgResult = this._applyDamage(targetPs, rawDmg, blocked);
+      const dmgTaken = dmgResult.dmgTaken;
 
       // Build hit event — server-authoritative hp now mirrors via
       // player_state below, but dmgTaken in the payload drives the
@@ -3838,6 +3906,7 @@ export class GameRoom {
           dmgTaken,
           isCrit: isCrit,
           blocked: blocked,
+          dodged: dmgResult.dodged,
           ts: Date.now(),
           rewindTicks: rewindTicks,
         }
