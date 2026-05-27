@@ -3010,11 +3010,12 @@ export class GameRoom {
     // from the attacker by kbForce px; freeze AI movement for 200 ms
     // (_tickMonsters skips position updates while _kbUntil > now) so
     // the bounce sticks instead of being immediately overwritten by
-    // chase movement.  Force ramps with hit type: 180 on special, 45
-    // on crit, 30 otherwise.  Clamped to zone bounds so a corner-shove
-    // doesn't fling the monster off the map.
+    // chase movement.  Force ramps with hit type: 60 on special (was
+    // 180, reduced 66% per user feedback the bounce was too far for
+    // melee follow-up), 45 on crit, 30 otherwise.  Clamped to zone
+    // bounds so a corner-shove doesn't fling the monster off the map.
     if (attackerPs) {
-      const kbForce = payload.special ? 180 : (isCrit ? 45 : 30);
+      const kbForce = payload.special ? 60 : (isCrit ? 45 : 30);
       const kbAng = Math.atan2(m.y - attackerPs.y, m.x - attackerPs.x);
       m.x += Math.cos(kbAng) * kbForce;
       m.y += Math.sin(kbAng) * kbForce;
