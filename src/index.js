@@ -635,9 +635,12 @@ export class GameRoom {
             const dmgResult = this._applyDamage(targetPs, m.dmg, false);
             const dmgTaken = dmgResult.dmgTaken;
             // Don't credit lifesteal damage on a dodge -- nothing to
-            // refund since no HP was taken.
+            // refund since no HP was taken.  But DO track during the
+            // zone-entry grace window so the next kill produces a
+            // refund instead of silently failing with 'no-this-mon'.
             if (!dmgResult.dodged) {
-              this._trackMonsterDamage(targetPs, m.id, dmgTaken);
+              const trackAmt = dmgResult.graced ? (dmgResult.dmgIntent || 0) : dmgTaken;
+              this._trackMonsterDamage(targetPs, m.id, trackAmt);
             }
             this.eventBuffer.push({
               type: 'monster_attack',
@@ -2176,14 +2179,17 @@ export class GameRoom {
   // dodge, dodged disambiguates so the caller can route to the right
   // popup.
   _applyDamage(ps, rawDmg, isBlock) {
-    if (!ps) return { dmgTaken: 0, dodged: false };
+    if (!ps) return { dmgTaken: 0, dodged: false, graced: false };
     const r = Math.max(1, Math.round(rawDmg || 0));
     // Zone-entry damage immunity (replaces the prior monster-shove on
     // zone entry).  Short grace window after the player drops into a
-    // combat zone so they can orient before hits land.  Treated as a
-    // silent miss -- not a dodge, so we don't trigger a "Dodge!" popup.
+    // combat zone so they can orient before hits land.  Returns
+    // graced:true so the caller can still track the would-be damage
+    // into dmgFromMonster -- otherwise the player kills the monster
+    // before any hits register and lifesteal silently produces
+    // reason:'no-this-mon' on the kill.
     if (ps._zoneEntryGraceUntil && Date.now() < ps._zoneEntryGraceUntil) {
-      return { dmgTaken: 0, dodged: false };
+      return { dmgTaken: 0, dodged: false, graced: true, dmgIntent: r };
     }
     if (isBlock) {
       ps.lastDamageAt = Date.now();
@@ -3563,13 +3569,7 @@ export class GameRoom {
             ps.vx = msg.vx || 0; ps.vy = msg.vy || 0;
             if (msg.dodging !== undefined) ps.dodging = !!msg.dodging;
             if (msg.blocking !== undefined) ps.blocking = !!msg.blocking;
-            // Only honor client setting dead=false (clears after
-            // respawn).  Server is authoritative for death via
-            // _handlePlayerDeath when hp <= 0; a stale dead=true from
-            // before respawn would otherwise block HP regen and
-            // lifesteal -- _tickPlayerRegen and the lifesteal credit
-            // path both early-return on ps.dead.
-            if (msg.dead === false) ps.dead = false;
+            if (msg.dead !== undefined) ps.dead = !!msg.dead;
             this.dirtyPlayers.add(session.id);
           }
 
