@@ -91,7 +91,7 @@ export default {
 const PRIVILEGED_EVENTS = new Set([
   // Pool / progression mirrors
   'player_state', 'player_died', 'player_respawned',
-  'combat_credit', 'harvest_credit', 'loot_credit', 'lifesteal_credit',
+  'combat_credit', 'harvest_credit', 'loot_credit', 'lifesteal_credit', 'loot_pickup_rejected',
   'stat_allocated', 'ability_rejected',
   // Combat resolution
   'monster_attack', 'monster_hit', 'monster_kill', 'pvp_hit',
@@ -189,7 +189,7 @@ export class GameRoom {
     // may grab it; pile despawns entirely at DEATH_PILE_TOTAL_MS.
     this.DEATH_PILE_OWNER_MS = 60000;
     this.DEATH_PILE_TOTAL_MS = 120000;
-    this.LOOT_PICKUP_RANGE = 30; // px; slightly looser than client's 20 to absorb position lag
+    this.LOOT_PICKUP_RANGE = 60; // px; was 30, bumped to absorb client/server position lag without silently dropping pickups
     // Zone-entry damage immunity window -- _applyDamage zeroes incoming
     // hits while ps._zoneEntryGraceUntil > now.  Long enough to orient
     // (read monster positions, raise shield), short enough that camping
@@ -2812,17 +2812,32 @@ export class GameRoom {
   }
 
   _handleLootPickup(session, payload) {
-    if (!session || !session.id) return;
+    // Diagnostic helper -- when a pickup is rejected silently the
+    // user has no signal why.  Emit loot_pickup_rejected with a
+    // reason so the client can render a floater the same way
+    // lifesteal does.
+    const reject = (reason, extra) => {
+      if (!session || !session.id) return;
+      const ws = this._wsBySessionId(session.id);
+      if (!ws) return;
+      try {
+        ws.send(JSON.stringify({
+          type: 'loot_pickup_rejected',
+          payload: { lootId: (payload && payload.lootId) || null, zone: (payload && payload.zone) || null, reason, ...(extra || {}) },
+        }));
+      } catch (e) {}
+    };
+    if (!session || !session.id) return;  // no session = no way to tell them
     const { lootId, zone } = payload || {};
-    if (!lootId || !zone) return;
+    if (!lootId || !zone) return reject('bad-payload');
     const list = this.loot[zone];
-    if (!list) return;
+    if (!list) return reject('no-loot-zone');
     const pile = list.find((p) => p.lootId === lootId);
-    if (!pile) return;
+    if (!pile) return reject('no-pile');
 
     // Already claimed this pile?  Per-player single claim for gold;
     // inventory is single-claim across the pile.
-    if (pile.claimedBy[session.id]) return;
+    if (pile.claimedBy[session.id]) return reject('already-claimed');
 
     // Recipient gate.  Death drops enforce owner-only until
     // ownerOnlyUntil, then anyone in zone may claim until expiry.
@@ -2831,16 +2846,24 @@ export class GameRoom {
       && Date.now() > pile.ownerOnlyUntil;
     if (!deathFreeForAll
         && pile.recipients
-        && !pile.recipients.includes(session.id)) return;
+        && !pile.recipients.includes(session.id)) {
+      return reject('not-recipient', { mySession: session.id, recipients: pile.recipients });
+    }
 
     // Range gate -- player must be near the pile per server-tracked
-    // position.  Slightly looser than the client's 20 px to absorb
-    // the 100 ms+ position lag between move events.
+    // position.  Bumped to 60 px (was 30) so client/server position
+    // lag during pickup doesn't silently drop legit grabs -- the
+    // client's own 20 px trigger is still the tight bound.
     const ps = this.playerState[session.id];
-    if (!ps || ps.z !== zone || ps.dead || ps.disconnected) return;
+    if (!ps) return reject('no-ps');
+    if (ps.z !== zone) return reject('wrong-zone', { psZ: ps.z });
+    if (ps.dead) return reject('dead');
+    if (ps.disconnected) return reject('disconnected');
     const dx = ps.x - pile.x;
     const dy = ps.y - pile.y;
-    if (dx * dx + dy * dy > this.LOOT_PICKUP_RANGE * this.LOOT_PICKUP_RANGE) return;
+    const distSq = dx * dx + dy * dy;
+    const rangeSq = this.LOOT_PICKUP_RANGE * this.LOOT_PICKUP_RANGE;
+    if (distSq > rangeSq) return reject('out-of-range', { dist: Math.round(Math.sqrt(distSq)), max: this.LOOT_PICKUP_RANGE });
 
     // Death-drop pickup: first picker grabs everything, pile despawns.
     // Separate code path from monster-kill loot since there are no
