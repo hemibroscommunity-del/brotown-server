@@ -2364,9 +2364,10 @@ export class GameRoom {
     if ('armor' in payload) {
       const incoming = payload.armor;
       let newArmor = null;
-      if (incoming && typeof incoming === 'object') {
+      if (incoming && typeof incoming === 'object' && incoming.name !== 'Leather Armor') {
         // Shallow copy + clamp tierMult.  Mirror the cap from _armorHp
         // so a forged blob with tierMult: 999 can't inflate maxHp.
+        // Leather Armor rejected outright per v2.3.249 removal.
         newArmor = { ...incoming };
         if (typeof newArmor.tierMult === 'number') {
           newArmor.tierMult = Math.max(0, Math.min(8, newArmor.tierMult));
@@ -3300,7 +3301,10 @@ export class GameRoom {
             this.playerState[msg.id].rangedWeapon = stored.rangedWeapon || null;
             this.playerState[msg.id].staffWeapon = stored.staffWeapon || null;
             this.playerState[msg.id].activeSlot = stored.activeSlot || 'melee';
-            this.playerState[msg.id].armor = stored.armor || null;
+            // v2.3.249: Leather Armor removed from the game.  Strip
+            // any persisted leather armor on load so pre-existing saves
+            // don't keep echoing it back to the client.
+            this.playerState[msg.id].armor = (stored.armor && stored.armor.name === 'Leather Armor') ? null : (stored.armor || null);
             this.playerState[msg.id].shield = stored.shield || null;
             this.playerState[msg.id].amulet = stored.amulet || null;
             this.playerState[msg.id].weaponStash = Array.isArray(stored.weaponStash) ? stored.weaponStash.slice(0, this.WEAPON_STASH_CAP) : [];
@@ -3372,7 +3376,11 @@ export class GameRoom {
             this.playerState[msg.id].rangedWeapon = (msg.data && msg.data.rpgRangedWeapon && typeof msg.data.rpgRangedWeapon === 'object') ? { ...msg.data.rpgRangedWeapon } : null;
             this.playerState[msg.id].staffWeapon = (msg.data && msg.data.rpgStaffWeapon && typeof msg.data.rpgStaffWeapon === 'object') ? { ...msg.data.rpgStaffWeapon } : null;
             this.playerState[msg.id].activeSlot = (msg.data && typeof msg.data.rpgActiveSlot === 'string') ? msg.data.rpgActiveSlot : 'melee';
-            this.playerState[msg.id].armor = (msg.data && msg.data.rpgArmor && typeof msg.data.rpgArmor === 'object') ? { ...msg.data.rpgArmor } : null;
+            // v2.3.249: drop leather armor from the first-connect bootstrap too.
+            {
+              const _bootArmor = (msg.data && msg.data.rpgArmor && typeof msg.data.rpgArmor === 'object') ? msg.data.rpgArmor : null;
+              this.playerState[msg.id].armor = (_bootArmor && _bootArmor.name === 'Leather Armor') ? null : (_bootArmor ? { ..._bootArmor } : null);
+            }
             this.playerState[msg.id].shield = (msg.data && msg.data.rpgShield && typeof msg.data.rpgShield === 'object') ? { ...msg.data.rpgShield } : null;
             this.playerState[msg.id].amulet = (msg.data && msg.data.rpgAmulet && typeof msg.data.rpgAmulet === 'object') ? { ...msg.data.rpgAmulet } : null;
             this.playerState[msg.id].weaponStash = (msg.data && Array.isArray(msg.data.rpgWeaponStash)) ? msg.data.rpgWeaponStash.slice(0, this.WEAPON_STASH_CAP) : [];
