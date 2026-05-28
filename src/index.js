@@ -194,7 +194,12 @@ export class GameRoom {
     // hits while ps._zoneEntryGraceUntil > now.  Long enough to orient
     // (read monster positions, raise shield), short enough that camping
     // an entry tile to farm isn't a thing.
-    this.ZONE_ENTRY_GRACE_MS = 1500;
+    // Long grace (1500 ms) was masking lifesteal after respawn -- the
+    // player could one-shot a monster before any damage tracked, so
+    // dmgFromMonster[m.id] stayed 0 and the kill produced reason
+    // 'no-this-mon'.  500 ms is enough to read positions on entry
+    // without suppressing the first incoming hit of a normal fight.
+    this.ZONE_ENTRY_GRACE_MS = 500;
     this.SHARD_DROP_RATE = 0.10; // 10% per kill, matches client rollMonsterShard
 
     // AFK timeout — drop sessions that haven't sent real input (move /
@@ -2525,6 +2530,12 @@ export class GameRoom {
       ps.respawnAt = 0;
       ps.z = 'town';
       ps.lastDamageAt = 0;
+      // Defense-in-depth: wipe again on respawn in case anything
+      // re-seeded inventory or dmgFromMonster between death and
+      // respawn (e.g., a late monster_attack tick).  Matches the
+      // wipe in _handlePlayerDeath.
+      ps.inventory = {};
+      ps.dmgFromMonster = {};
       this._saveRpg(id, ps);
       const ws = this._wsBySessionId(id);
       if (ws) {
@@ -3552,7 +3563,13 @@ export class GameRoom {
             ps.vx = msg.vx || 0; ps.vy = msg.vy || 0;
             if (msg.dodging !== undefined) ps.dodging = !!msg.dodging;
             if (msg.blocking !== undefined) ps.blocking = !!msg.blocking;
-            if (msg.dead !== undefined) ps.dead = !!msg.dead;
+            // Only honor client setting dead=false (clears after
+            // respawn).  Server is authoritative for death via
+            // _handlePlayerDeath when hp <= 0; a stale dead=true from
+            // before respawn would otherwise block HP regen and
+            // lifesteal -- _tickPlayerRegen and the lifesteal credit
+            // path both early-return on ps.dead.
+            if (msg.dead === false) ps.dead = false;
             this.dirtyPlayers.add(session.id);
           }
 
