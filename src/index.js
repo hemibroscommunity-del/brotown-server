@@ -190,6 +190,11 @@ export class GameRoom {
     this.DEATH_PILE_OWNER_MS = 60000;
     this.DEATH_PILE_TOTAL_MS = 120000;
     this.LOOT_PICKUP_RANGE = 30; // px; slightly looser than client's 20 to absorb position lag
+    // Zone-entry damage immunity window -- _applyDamage zeroes incoming
+    // hits while ps._zoneEntryGraceUntil > now.  Long enough to orient
+    // (read monster positions, raise shield), short enough that camping
+    // an entry tile to farm isn't a thing.
+    this.ZONE_ENTRY_GRACE_MS = 1500;
     this.SHARD_DROP_RATE = 0.10; // 10% per kill, matches client rollMonsterShard
 
     // AFK timeout — drop sessions that haven't sent real input (move /
@@ -2168,6 +2173,13 @@ export class GameRoom {
   _applyDamage(ps, rawDmg, isBlock) {
     if (!ps) return { dmgTaken: 0, dodged: false };
     const r = Math.max(1, Math.round(rawDmg || 0));
+    // Zone-entry damage immunity (replaces the prior monster-shove on
+    // zone entry).  Short grace window after the player drops into a
+    // combat zone so they can orient before hits land.  Treated as a
+    // silent miss -- not a dodge, so we don't trigger a "Dodge!" popup.
+    if (ps._zoneEntryGraceUntil && Date.now() < ps._zoneEntryGraceUntil) {
+      return { dmgTaken: 0, dodged: false };
+    }
     if (isBlock) {
       ps.lastDamageAt = Date.now();
       return { dmgTaken: 0, dodged: false };
@@ -3545,38 +3557,15 @@ export class GameRoom {
               // Combat zone -- send the new zone's monster + gather +
               // loot state so the client can render them.
               const newMonsters = this._ensureZoneMonsters(ps.z);
-              // Push any monster within the safe entry radius away from
-              // the player's drop-in position so they don't take damage
-              // before they can react.  Mirrors the client's pre-server
-              // logic at BroTown.jsx:5549; without it, the server's
-              // randomly-placed monsters can spawn right on top of the
-              // entry coords.  Also clamps to the playable area so a
-              // monster pushed near the edge doesn't end up out of bounds.
-              const ENTRY_SAFE_RADIUS = 280;
-              const zoneCfg = this._getZoneConfig(ps.z);
-              if (zoneCfg) {
-                const W = zoneCfg.w * this.TILE;
-                const H = zoneCfg.h * this.TILE;
-                const edgePad = 3 * this.TILE;
-                for (const m of newMonsters) {
-                  if (!m.alive) continue;
-                  const mdx = m.x - ps.x;
-                  const mdy = m.y - ps.y;
-                  const md = Math.sqrt(mdx * mdx + mdy * mdy);
-                  if (md > 0 && md < ENTRY_SAFE_RADIUS) {
-                    const k = ENTRY_SAFE_RADIUS / md;
-                    m.x = Math.max(edgePad, Math.min(W - edgePad, ps.x + mdx * k));
-                    m.y = Math.max(edgePad, Math.min(H - edgePad, ps.y + mdy * k));
-                  } else if (md === 0) {
-                    // Spawned exactly on top of player: shove right.
-                    m.x = Math.min(W - edgePad, ps.x + ENTRY_SAFE_RADIUS);
-                  }
-                  // Reset spawnX/Y so respawn doesn't drop them back on
-                  // the entry tile.
-                  m.spawnX = m.x;
-                  m.spawnY = m.y;
-                }
-              }
+              // Zone-entry damage immunity: replaces the prior
+              // ENTRY_SAFE_RADIUS monster-shove (visually janky
+              // teleport) with a 1500 ms grace window where incoming
+              // damage to the player is zeroed.  _applyDamage reads
+              // ps._zoneEntryGraceUntil and short-circuits to 0 dmg /
+              // 0 dodge while it's in the future, so monsters can
+              // walk/swing as normal but the player has a moment to
+              // orient before hits land.
+              ps._zoneEntryGraceUntil = Date.now() + this.ZONE_ENTRY_GRACE_MS;
               ws.send(JSON.stringify({
                 type: 'zone_monsters',
                 zone: ps.z,
