@@ -90,7 +90,15 @@ export default {
 // (e.g. forge player_state { hp: 0 } to one-shot everyone).
 const PRIVILEGED_EVENTS = new Set([
   // Pool / progression mirrors
-  'player_state', 'player_died', 'player_respawned',
+  'player_state', 'player_died',
+  // 'player_respawned' intentionally OMITTED: the client broadcasts it
+  // to peers as a visual signal (clears _isDead on remote entries so
+  // the corpse stops rendering).  Blocking it here leaves other clients
+  // showing the respawned player as a corpse forever.  The server's
+  // own server->self player_respawned still fires (direct ws.send,
+  // doesn't route through this deny-list).  Forgery risk is purely
+  // visual -- a cheater can clear their own corpse on others' screens
+  // but can't actually revive themselves server-side.
   'combat_credit', 'harvest_credit', 'loot_credit', 'lifesteal_credit', 'loot_pickup_rejected',
   'stat_allocated', 'ability_rejected',
   // Combat resolution
