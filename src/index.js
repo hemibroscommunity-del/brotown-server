@@ -356,7 +356,7 @@ export class GameRoom {
         const maxLvl = zone.level[1] || 10;
         const lvl = Math.max(1, Math.round(baseLvl + depthPct * (maxLvl - baseLvl)));
         const a = this._getArchetype(spawn.arch);
-        const baseHp = this._monsterStat(60, lvl, 1.065, 1.035, 1.025);
+        const baseHp = this._monsterStat(12.5, lvl, 1.065, 1.035, 1.025); // baseline-10 rescale: 60 ÷ 4.8
         const baseDmg = this._monsterStat(12, lvl, 1.045, 1.025, 1.018);
         const baseXp = this._monsterStat(10, lvl, 1.045, 1.025, 1.018);
         const baseGold = this._monsterStat(5, lvl, 1.035, 1.020, 1.015);
@@ -1155,8 +1155,13 @@ export class GameRoom {
   // server-computed weapon damage.  Keep in sync if new weapon types
   // ship to the client.
   _weaponBase(type) {
-    const T = { greatsword: 48, sword: 32, bow: 35, staff: 41 };
-    return T[type] || 30;
+    // Baseline-10 rescale (÷4.8): greatsword 48->10 (stays hardest).
+    // Mirrors WEAPON_TYPES base in src/data/gameSystems.js (the client
+    // mirror divides the same table).  Shared by _computeAttackDamage,
+    // the _maxWeaponDmg cap, and _weaponSellValue -- sell values scale
+    // down 4.8x in lockstep with the client (coins are NOT rescaled).
+    const T = { greatsword: 10, sword: 6.67, bow: 7.29, staff: 8.54 };
+    return T[type] || 6.25;          // fists fallback (was 30)
   }
 
   // Sell value mirrors the client at BroTown.jsx ~26613:
@@ -3004,11 +3009,12 @@ export class GameRoom {
   _maxWeaponDmg(ps, isSpecial) {
     if (!ps) return 0;
     const candidates = [ps.weapon, ps.rangedWeapon, ps.staffWeapon].filter(Boolean);
-    if (candidates.length === 0) return 30; // fists fallback
+    if (candidates.length === 0) return 6.25; // fists fallback (baseline-10: 30 ÷ 4.8)
     let max = 0;
     // Phase 4a of the T1/T2 spec: Mind scales special attacks; Power
-    // still scales normal swings.
-    const statBonus = isSpecial ? ((ps.mind || 0) * 0.8) : ((ps.power || 0) * 0.8);
+    // still scales normal swings.  Coefficient baseline-10 rescaled
+    // (0.8 ÷ 4.8 = 0.1667) so the cap tracks the new damage scale.
+    const statBonus = isSpecial ? ((ps.mind || 0) * 0.1667) : ((ps.power || 0) * 0.1667);
     for (const w of candidates) {
       const base = (this._weaponBase(w.type) + statBonus) * (w.tierMult || 1);
       if (base > max) max = base;
@@ -3017,7 +3023,7 @@ export class GameRoom {
   }
 
   _maxDmgForAttacker(ps, isSpecial) {
-    if (!ps) return 100;
+    if (!ps) return 21; // baseline-10: 100 ÷ 4.8
     const maxWpn = this._maxWeaponDmg(ps, isSpecial);
     // Phase 3: crit damage scales on Power AND Ferocity (Power first).
     const critMult = 1.5 + (ps.power || 0) * 0.001 + (ps.ferocity || 0) * 0.0008;
@@ -3025,12 +3031,67 @@ export class GameRoom {
     // SPECIAL_ATK_MULT = 2.0 applied client-side; double the cap on
     // special hits so they don't get rejected as too-high.
     const specialMult = isSpecial ? 2.0 : 1.0;
-    return Math.max(100, Math.ceil(maxWpn * critMult * comboBoost * specialMult));
+    // Floor baseline-10 rescaled (100 ÷ 4.8 ≈ 21) so it doesn't sit ~10x
+    // above a real hit.  Now a sanity backstop on the server's own roll
+    // (monster damage is server-computed) AND the PvP dmgBase cap.
+    return Math.max(21, Math.ceil(maxWpn * critMult * comboBoost * specialMult));
+  }
+
+  // Server-authoritative player->monster damage roll.  Mirrors the
+  // client's calcWeaponDmg / calcSpecialDmg (src/data/gameSystems.js)
+  // plus calcCritChance / calcCritMult, on the baseline-10 (÷4.8) scale.
+  // The client now sends an INTENT (which slot, special or not) instead
+  // of a damage number -- the server rolls the actual value here so the
+  // last client-trusted-damage cheat vector is closed.
+  //
+  // NOTE (scoped per the server-computed-damage spec): this roll covers
+  // weapon base + governing stat + per-type variance + special (2x) +
+  // volatile (1.3x) + cooked damage buff (1.2x) + crit.  It deliberately
+  // omits amulet elemDmg / elementalMastery / curse / elemental-collision
+  // combo damage -- those stay client-side for now and are a follow-up
+  // slice (the server has no elemental-status model).  So an elemental
+  // combo build's authoritative damage is weapon-only until then.
+  _computeAttackDamage(ps, slot, isSpecial) {
+    if (!ps) return { dmg: 1, isCrit: false };
+    // Trust the wire slot when it's a known value, else fall back to the
+    // server's tracked activeSlot (mirrors the lifesteal slot resolution).
+    const eff = (slot === 'melee' || slot === 'ranged' || slot === 'staff')
+      ? slot : (ps.activeSlot || 'melee');
+    const w = eff === 'ranged' ? ps.rangedWeapon
+            : eff === 'staff'  ? ps.staffWeapon
+            :                    ps.weapon;
+    const type = (w && w.type) || 'greatsword';
+    const tierMult = (w && w.tierMult) || 1;
+    // Governing stat mirrors client EQUIP_STAT_MAP: melee (greatsword +
+    // sword) = power, bow = agility, staff = mind.  All specials scale on
+    // Mind regardless of weapon (client calcSpecialDmg).
+    const stat = isSpecial ? (ps.mind || 0)
+               : type === 'bow'   ? (ps.agility || 0)
+               : type === 'staff' ? (ps.mind || 0)
+               :                    (ps.power || 0);
+    let base = (this._weaponBase(type) + stat * 0.1667) * tierMult; // 0.8 ÷ 4.8
+    // Per-type variance -- same rolls as the client.
+    const v = type === 'staff' ? (0.5  + Math.random() * 1.0)
+            : type === 'bow'   ? (0.6  + Math.random() * 0.2)
+            :                    (0.75 + Math.random() * 0.5);
+    base *= v;
+    if (isSpecial) base *= 2.0;                        // SPECIAL_ATK_MULT
+    if (w && w.isVolatile) base *= 1.30;               // §4.7 volatile weapon
+    if (this._buffActive(ps, 'damage')) base *= 1.20;  // cooked damage buff (client gameLoop.js:2346)
+    // Crit (calcCritChance + calcCritMult).
+    const P = ps.power || 0, F = ps.ferocity || 0;
+    const critChance = Math.max(0, Math.min(1,
+      40 * P / (P + 200) / 100 + 30 * F / (F + 250) / 100));
+    const isCrit = Math.random() < critChance;
+    if (isCrit) base *= (1.5 + P * 0.001 + F * 0.0008);
+    return { dmg: Math.max(1, Math.round(base)), isCrit };
   }
 
   _handleMonsterDamage(session, payload) {
-    const { monsterId, zone, dmg, isCrit, element, slot } = payload;
-    if (!monsterId || !zone || !dmg) return;
+    // Client damage number is no longer trusted -- ignore payload.dmg /
+    // payload.isCrit; we keep only the intent (slot + special) + element.
+    const { monsterId, zone, element, slot } = payload;
+    if (!monsterId || !zone) return;
     const monsters = this.monsters[zone];
     if (!monsters) return;
     const m = monsters.find(x => x.id === monsterId);
@@ -3042,11 +3103,14 @@ export class GameRoom {
     // Also clamp the incoming value to the per-level cap so a cheater
     // can't claim 99999 damage to one-shot tough monsters.
     const attackerPs = this.playerState[session.id];
-    // Weapon-aware cap (slice 16, refreshed for T1/T2 spec): now
-    // accepts isSpecial so special-attack damage (which scales on
-    // Mind + 2x SPECIAL_ATK_MULT per Phase 4a) doesn't get rejected.
-    const dmgCap = this._maxDmgForAttacker(attackerPs, !!payload.special);
-    const rawDmg = Math.max(1, Math.min(dmgCap, Math.round(dmg)));
+    const isSpecial = !!payload.special;
+    // Server computes the actual damage from server-tracked stats +
+    // weapon + the client's intent (slot/special).  _maxDmgForAttacker
+    // stays as a cheap sanity clamp on our OWN roll (weapon-aware, slice
+    // 16 / T1-T2): special hits get the 2x cap headroom.
+    const rolled = this._computeAttackDamage(attackerPs, slot, isSpecial);
+    const dmgCap = this._maxDmgForAttacker(attackerPs, isSpecial);
+    const rawDmg = Math.max(1, Math.min(dmgCap, rolled.dmg));
     const actualDmg = Math.min(rawDmg, Math.max(0, m.hp));
     // Subtract actualDmg (capped at remaining hp) so m.hp doesn't go
     // negative on overkill -- otherwise the broadcast hpPct goes < 0
@@ -3084,7 +3148,7 @@ export class GameRoom {
     // immediately; visual bounce is briefer but the damage economy
     // works.
     if (attackerPs) {
-      const kbForce = payload.special ? 60 : (isCrit ? 45 : 30);
+      const kbForce = payload.special ? 60 : (rolled.isCrit ? 45 : 30);
       const kbAng = Math.atan2(m.y - attackerPs.y, m.x - attackerPs.x);
       m.x += Math.cos(kbAng) * kbForce;
       m.y += Math.sin(kbAng) * kbForce;
@@ -3107,7 +3171,7 @@ export class GameRoom {
         monsterId: m.id,
         zone,
         dmg: actualDmg,
-        isCrit: !!isCrit,
+        isCrit: rolled.isCrit,
         attackerId: session.id,
         hpPct: Math.max(0, m.hp / m.maxHp),
       }
