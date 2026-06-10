@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "smoke": "node scripts/smoke-test.mjs",
+    "loadtest": "node scripts/load-test.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.96.0"

@@ -111,11 +111,25 @@ const PRIVILEGED_EVENTS = new Set([
   'player_join', 'player_leave', 'player_update',
 ]);
 
+// Wire-precision helpers.  Client positions arrive as raw physics
+// floats (e.g. 213.45289554689) and were echoed verbatim — at 45Hz to
+// a full room that's most of the tick bandwidth.  Clients interpolate
+// remote entities, so 0.1px is invisible.  Rounding happens only at
+// serialization time; stored state keeps full precision so movement
+// validation never accumulates drift.
+const round1 = (n) => (typeof n === 'number' ? Math.round(n * 10) / 10 : n);
+const round4 = (n) => (typeof n === 'number' ? Math.round(n * 10000) / 10000 : n);
+
 export class GameRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
     this.sessions = new Map();
+    // Reverse index: playerId -> WebSocket.  Kept in sync at join /
+    // close so _wsBySessionId / _sessionById are O(1) instead of
+    // scanning every session (they're called per-tick from the
+    // player_state flush and per-recipient on every kill).
+    this.wsBySession = new Map();
     this.playerState = {};
     this.dirtyPlayers = new Set();
     this.eventBuffer = [];
@@ -135,6 +149,14 @@ export class GameRoom {
     // still emit immediately since they're rare and want snappy
     // response.
     this.pendingPlayerStateFlush = new Set();
+
+    // Write-behind RPG persistence.  _saveRpg used to storage.put the
+    // full ~40-field blob immediately at every call site (every monster
+    // attack, every kill recipient, every pickup...).  Mutators now just
+    // mark the player dirty here and _flushRpgSaves() issues one batched
+    // put per tick.  webSocketClose flushes the leaving player directly
+    // so nothing is lost on disconnect.
+    this.pendingRpgSave = new Set();
 
     // §16.12 — PvP Lag Compensation
     this.stateHistory = {};
@@ -157,6 +179,9 @@ export class GameRoom {
     this.MONSTER_ATTACK_RANGE = 45;
     this.MONSTER_ATTACK_CD = 1500; // ms
     this.TILE = 32;
+    // Broadcast monster state every Nth tick (45Hz / 2 ≈ 22Hz on the
+    // wire).  Set to 1 to restore per-tick monster broadcasts.
+    this.MONSTER_BROADCAST_DIVISOR = 2;
 
     // Server-authoritative gather nodes (trees / fish spots / ore veins).
     // Parallel to the monster pattern above: lazy-spawn on first player
@@ -428,18 +453,25 @@ export class GameRoom {
   _tickMonsters() {
     const now = Date.now();
     const activeZones = this._activeZones();
+    if (activeZones.size === 0) return;
+
+    // Bucket players by zone in one pass.  This used to run per zone
+    // (O(zones × players)) and spread-copy each player's entire state
+    // object 45 times a second; the AI below only reads id / x / y /
+    // blocking, so snapshot just those.
+    const playersByZone = new Map();
+    for (const [id, ps] of Object.entries(this.playerState)) {
+      if (ps.dead || ps.disconnected || !activeZones.has(ps.z)) continue;
+      let bucket = playersByZone.get(ps.z);
+      if (!bucket) { bucket = []; playersByZone.set(ps.z, bucket); }
+      bucket.push({ id, x: ps.x, y: ps.y, blocking: ps.blocking });
+    }
 
     for (const zoneId of activeZones) {
       const monsters = this._ensureZoneMonsters(zoneId);
       if (!monsters || monsters.length === 0) continue;
 
-      // Get players in this zone
-      const playersInZone = [];
-      for (const [id, ps] of Object.entries(this.playerState)) {
-        if (ps.z === zoneId && !ps.dead && !ps.disconnected) {
-          playersInZone.push({ id, ...ps });
-        }
-      }
+      const playersInZone = playersByZone.get(zoneId) || [];
 
       let zoneChanged = false;
 
@@ -508,8 +540,11 @@ export class GameRoom {
         // This is what makes ranged attacks actually pull a monster
         // off its wander -- previously aggro was proximity-only so a
         // sniped mummy just took the hit and kept patrolling.
+        // Squared distances throughout the scan — the only places the
+        // true distance is needed (movement normalization, anisotropic
+        // attack ring) take their own sqrt below.
         let nearest = null;
-        let nearestDist = Infinity;
+        let nearestDistSq = Infinity;
         const stickyAggroActive = m._aggroOverrideUntil && now < m._aggroOverrideUntil;
         if (stickyAggroActive) {
           const stickyP = playersInZone.find(p => p.id === m._aggroOverrideTarget);
@@ -517,7 +552,7 @@ export class GameRoom {
             const dxS = stickyP.x - m.x;
             const dyS = stickyP.y - m.y;
             nearest = stickyP;
-            nearestDist = Math.sqrt(dxS * dxS + dyS * dyS);
+            nearestDistSq = dxS * dxS + dyS * dyS;
           } else {
             // Sticky target left the zone -- drop the override and
             // fall through to proximity.
@@ -529,10 +564,10 @@ export class GameRoom {
           for (const p of playersInZone) {
             const dx = p.x - m.x;
             const dy = p.y - m.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < nearestDist) {
+            const distSq = dx * dx + dy * dy;
+            if (distSq < nearestDistSq) {
               nearest = p;
-              nearestDist = dist;
+              nearestDistSq = distSq;
             }
           }
         }
@@ -565,7 +600,7 @@ export class GameRoom {
         // damaged but still wouldn't pass the proximity gate to enter
         // the chase branch.
         const effAggroRange = stickyAggroActive ? 1200 : this.MONSTER_AGGRO_RANGE;
-        if (nearest && nearestDist < effAggroRange) {
+        if (nearest && nearestDistSq < effAggroRange * effAggroRange) {
           m.targetId = nearest.id;
           const dxA = nearest.x - m.x;
           const dyA = nearest.y - m.y;
@@ -577,12 +612,10 @@ export class GameRoom {
           // event so the body stops sliding during the swing/lunge sheet.
           const attackingNow = m._attackingUntil && now < m._attackingUntil;
           if (attackDist > ATTACK_RANGE && !attackingNow) {
-            const dx = nearest.x - m.x;
-            const dy = nearest.y - m.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
+            const dist = Math.sqrt(nearestDistSq);
             if (dist > 0) {
-              m.x += (dx / dist) * m.spd;
-              m.y += (dy / dist) * m.spd;
+              m.x += (dxA / dist) * m.spd;
+              m.y += (dyA / dist) * m.spd;
               zoneChanged = true;
             }
           }
@@ -659,8 +692,8 @@ export class GameRoom {
                 dmgTaken,
                 dodged: dmgResult.dodged,
                 zone: zoneId,
-                attackerX: m.x,
-                attackerY: m.y,
+                attackerX: Math.round(m.x),
+                attackerY: Math.round(m.y),
               }
             });
             // Echo authoritative hp to the victim + persist.  Death
@@ -2045,11 +2078,48 @@ export class GameRoom {
     }
   }
 
-  async _saveRpg(playerId, ps) {
+  // Mark a player's RPG state for persistence.  The actual storage
+  // write happens in _flushRpgSaves() at end-of-tick (batched across
+  // players), or in webSocketClose for a leaving player.  Call sites
+  // that need persistence ordering (the join bootstrap) use
+  // _saveRpgNow instead.
+  _saveRpg(playerId, ps) {
     if (!playerId || !ps) return;
-    this._pruneBuffs(ps);
+    this.pendingRpgSave.add(playerId);
+  }
+
+  async _saveRpgNow(playerId, ps) {
+    if (!playerId || !ps) return;
     try {
-      await this.state.storage.put('rpg:' + playerId, {
+      await this.state.storage.put('rpg:' + playerId, this._buildRpgBlob(ps));
+    } catch (e) {}
+  }
+
+  // One batched storage.put per tick for every player marked dirty by
+  // _saveRpg since the last flush.  Collapses e.g. an 8-recipient kill
+  // (formerly 8 sequential puts of full blobs) into a single multi-key
+  // write.  DO storage caps batched puts at 128 keys; MAX_PLAYERS=50
+  // keeps us under it, but guard anyway by carrying overflow to the
+  // next tick.
+  _flushRpgSaves() {
+    if (this.pendingRpgSave.size === 0) return;
+    const entries = {};
+    let count = 0;
+    for (const id of this.pendingRpgSave) {
+      if (count >= 128) break;
+      this.pendingRpgSave.delete(id);
+      const ps = this.playerState[id];
+      if (!ps) continue;
+      entries['rpg:' + id] = this._buildRpgBlob(ps);
+      count++;
+    }
+    if (count === 0) return;
+    try { Promise.resolve(this.state.storage.put(entries)).catch(() => {}); } catch (e) {}
+  }
+
+  _buildRpgBlob(ps) {
+    this._pruneBuffs(ps);
+    return {
         coins: ps.coins || 0,
         inventory: ps.inventory || {},
         lifeSkills: ps.lifeSkills || {},
@@ -2107,8 +2177,7 @@ export class GameRoom {
         // would otherwise let them claim 'perfect' indefinitely
         // by cycling the WS connection between batches).
         _perfectHistory: Array.isArray(ps._perfectHistory) ? ps._perfectHistory : [],
-      });
-    } catch (e) {}
+    };
   }
 
   // Queue a player_state emit for the next tick flush.  Used by
@@ -2695,15 +2764,20 @@ export class GameRoom {
   // visual state.  inventoryClaimed is part of the wire because
   // late-joiners + zone-change syncs need it.
   _serializePile(p) {
+    // Wire copy only — pickup validation reads the stored pile, so the
+    // rounding here is purely cosmetic (pile position render + share
+    // preview); the authoritative shares keep full precision.
+    const wireShares = {};
+    for (const k in p.shares) wireShares[k] = round4(p.shares[k]);
     return {
       lootId: p.lootId,
       zone: p.zone,
-      x: p.x, y: p.y,
+      x: Math.round(p.x), y: Math.round(p.y),
       coins: p.coins,
       skull: p.skull,
       shard: p.shard,
       recipients: p.recipients,
-      shares: p.shares,
+      shares: wireShares,
       killerName: p.killerName,
       ts: p.ts,
       inventoryClaimed: p.inventoryClaimed,
@@ -2774,17 +2848,12 @@ export class GameRoom {
   }
 
   _sessionById(sessionId) {
-    for (const [, s] of this.sessions) {
-      if (s.id === sessionId) return s;
-    }
-    return null;
+    const ws = this.wsBySession.get(sessionId);
+    return ws ? (this.sessions.get(ws) || null) : null;
   }
 
   _wsBySessionId(sessionId) {
-    for (const [ws, s] of this.sessions) {
-      if (s.id === sessionId) return ws;
-    }
-    return null;
+    return this.wsBySession.get(sessionId) || null;
   }
 
   _despawnLoot(zone, lootId) {
@@ -3173,7 +3242,7 @@ export class GameRoom {
         dmg: actualDmg,
         isCrit: rolled.isCrit,
         attackerId: session.id,
-        hpPct: Math.max(0, m.hp / m.maxHp),
+        hpPct: Math.max(0, round4(m.hp / m.maxHp)),
       }
     });
 
@@ -3374,7 +3443,23 @@ export class GameRoom {
 
     switch (msg.type) {
       case 'join':
+        // Duplicate login: if another live socket already owns this
+        // player id, evict it before the new one takes over.  Removing
+        // it from sessions immediately (rather than waiting for its
+        // close event) keeps getPlayerCount honest and stops the old
+        // socket from receiving broadcasts for a player it no longer
+        // controls.  Its eventual webSocketClose becomes a no-op.
+        {
+          const prevWs = this.wsBySession.get(msg.id);
+          if (prevWs && prevWs !== ws) {
+            this.sessions.delete(prevWs);
+            try { prevWs.close(1000, 'duplicate login'); } catch {}
+          }
+        }
         session.id = msg.id;
+        // Newest socket wins the reverse index — on duplicate login the
+        // fresh connection is the one that should receive private sends.
+        this.wsBySession.set(msg.id, ws);
         session.name = msg.name || 'Anon';
         session.data = msg.data || {};
         this.playerState[msg.id] = {
@@ -3382,7 +3467,7 @@ export class GameRoom {
           dodging: false, blocking: false, dead: false, disconnected: false,
           ...msg.data
         };
-        this.stateHistory[msg.id] = [];
+        this.stateHistory[msg.id] = this._newHistoryRing();
         /* Load (or bootstrap) the player's server-authoritative
            coins + inventory.  Stored entry wins; if there's no
            record yet, fall back to the values the client sent in
@@ -3533,7 +3618,7 @@ export class GameRoom {
             this.playerState[msg.id].achievementPoints = Math.max(0, Math.min(99999,
               (msg.data && typeof msg.data.rpgAchievementPoints === 'number') ? Math.floor(msg.data.rpgAchievementPoints) : 0));
             this.playerState[msg.id]._perfectHistory = [];
-            await this._saveRpg(msg.id, this.playerState[msg.id]);
+            await this._saveRpgNow(msg.id, this.playerState[msg.id]);
           }
           // Session-only equipment-derived values.  Always read from join
           // — recomputed client-side on every recalcDerived.
@@ -3999,12 +4084,16 @@ export class GameRoom {
       if (targetPs.z !== attackerPs.z) continue; // different zone
       if (targetPs.dead || targetPs.disconnected) continue;
 
-      // §16.12 — Look up target's historical state
+      // §16.12 — Look up target's historical state in the ring.
+      // head-1 is the most recent snapshot; rewind clamps to the
+      // oldest retained entry (same semantics as the old array index
+      // clamp to 0).
       const history = this.stateHistory[targetId];
       let checkState = targetPs; // fallback: current state
-      if (history && history.length > 0) {
-        const idx = Math.max(0, history.length - 1 - rewindTicks);
-        checkState = history[idx] || targetPs;
+      if (history && history.len > 0) {
+        const back = Math.min(rewindTicks, history.len - 1);
+        const N = this.LAGCOMP_BUFFER_TICKS;
+        checkState = history.buf[(history.head - 1 - back + N * 2) % N] || targetPs;
       }
 
       // Range check against historical position
@@ -4068,7 +4157,19 @@ export class GameRoom {
 
   async webSocketClose(ws) {
     const session = this.sessions.get(ws);
-    if (session?.id) {
+    // Tear down player state only if this socket still owns the player
+    // id — after a duplicate-login rejoin the old socket's close must
+    // not wipe the live connection's state or broadcast a bogus
+    // player_leave.  (The join handler also evicts the old socket from
+    // sessions, so this guard is a backstop for racing close events.)
+    if (session?.id && this.wsBySession.get(session.id) === ws) {
+      this.wsBySession.delete(session.id);
+      // Persist any write-behind state before it's deleted below;
+      // mutations only mark-dirty now, so this is the last chance.
+      if (this.pendingRpgSave.has(session.id)) {
+        this.pendingRpgSave.delete(session.id);
+        await this._saveRpgNow(session.id, this.playerState[session.id]);
+      }
       if (this.playerState[session.id]) this.playerState[session.id].disconnected = true;
       delete this.playerState[session.id];
       delete this.stateHistory[session.id];
@@ -4083,24 +4184,33 @@ export class GameRoom {
 
   async webSocketError(ws) { this.webSocketClose(ws); }
 
+  // Fixed-size ring for §16.12 lag-comp snapshots.  buf[head] is the
+  // next write slot; the most recent snapshot lives at head-1 (mod N).
+  _newHistoryRing() {
+    return { buf: new Array(this.LAGCOMP_BUFFER_TICKS), head: 0, len: 0 };
+  }
+
   startTickLoop() {
     let pingCounter = 0;
     let regenCounter = 0;
 
     this.tickInterval = setInterval(() => {
-      // §16.12 — Snapshot player states to history buffer
+      // §16.12 — Snapshot player states to history ring buffer.
+      // Fixed-size ring (LAGCOMP_BUFFER_TICKS slots) overwritten in
+      // place; replaces the old push + shift array which moved every
+      // element once the buffer filled.
       for (const [id, ps] of Object.entries(this.playerState)) {
-        if (!this.stateHistory[id]) this.stateHistory[id] = [];
-        this.stateHistory[id].push({
+        let h = this.stateHistory[id];
+        if (!h) h = this.stateHistory[id] = this._newHistoryRing();
+        h.buf[h.head] = {
           x: ps.x, y: ps.y, d: ps.d, z: ps.z,
           dodging: ps.dodging || false,
           blocking: ps.blocking || false,
           dead: ps.dead || false,
           tick: this.tickSeq,
-        });
-        if (this.stateHistory[id].length > this.LAGCOMP_BUFFER_TICKS) {
-          this.stateHistory[id].shift();
-        }
+        };
+        h.head = (h.head + 1) % this.LAGCOMP_BUFFER_TICKS;
+        if (h.len < this.LAGCOMP_BUFFER_TICKS) h.len++;
       }
 
       // Monster AI tick
@@ -4136,6 +4246,10 @@ export class GameRoom {
       // updates to the same player collapse to one wire emit.
       this._flushPendingPlayerStates();
 
+      // Write-behind RPG persistence — one batched storage.put for
+      // every player _saveRpg-marked dirty this tick.
+      this._flushRpgSaves();
+
       // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
       if (pingCounter >= 90) {
@@ -4154,7 +4268,16 @@ export class GameRoom {
 
       const hasDirty = this.dirtyPlayers.size > 0;
       const hasEvents = this.eventBuffer.length > 0;
-      const hasMonsters = this.dirtyMonsters.size > 0;
+      // Monster positions broadcast every MONSTER_BROADCAST_DIVISOR-th
+      // tick (~22Hz at divisor 2) instead of every tick.  Chasing
+      // monsters re-dirty their zone at 45Hz, which made monster data
+      // ~half of all room bandwidth; clients render interpolated
+      // movement, so the halved cadence is invisible.  Skipped ticks
+      // keep the zones dirty, so nothing is lost — combat feedback
+      // (monster_hit / monster_kill with hpPct) still rides the event
+      // buffer on the very next tick.  AI itself still runs at 45Hz.
+      const hasMonsters = this.dirtyMonsters.size > 0
+        && (this.tickSeq % this.MONSTER_BROADCAST_DIVISOR === 0);
       const hasNodes = this.dirtyNodes.size > 0;
       if (!hasDirty && !hasEvents && !hasMonsters && !hasNodes) { this.tickSeq++; return; }
 
@@ -4166,7 +4289,7 @@ export class GameRoom {
         const players = {};
         for (const id of this.dirtyPlayers) {
           const ps = this.playerState[id];
-          if (ps) players[id] = { x: ps.x, y: ps.y, d: ps.d, z: ps.z, vx: ps.vx, vy: ps.vy };
+          if (ps) players[id] = { x: round1(ps.x), y: round1(ps.y), d: ps.d, z: ps.z, vx: round1(ps.vx), vy: round1(ps.vy) };
         }
         delta.players = players;
         this.dirtyPlayers.clear();
@@ -4354,17 +4477,24 @@ export class Marketplace {
 
   // §39.4 — Query using index. If category+subtype+tier all specified, direct bucket lookup.
   // Otherwise scan relevant buckets with filtering.
+  // Category/subtype/tier are the leading parts of every bucket key,
+  // so whole buckets are skipped on a key check instead of testing
+  // those fields per order.
   _queryOrders(category, subtype, tier, playerId, limit) {
     const results = [];
-    for (const [, bucket] of this.index) {
-      const all = [...bucket.buys, ...bucket.sells];
-      for (const o of all) {
-        if (category && o.category !== category) continue;
-        if (subtype && o.subtype !== subtype) continue;
-        if (tier && o.tierKey !== tier) continue;
-        if (playerId && o.playerId !== playerId) continue;
-        results.push(o);
-        if (results.length >= limit) return results;
+    for (const [key, bucket] of this.index) {
+      if (category || subtype || tier) {
+        const [kc, ks, kt] = key.split(':');
+        if (category && kc !== category) continue;
+        if (subtype && ks !== subtype) continue;
+        if (tier && kt !== tier) continue;
+      }
+      for (const list of [bucket.buys, bucket.sells]) {
+        for (const o of list) {
+          if (playerId && o.playerId !== playerId) continue;
+          results.push(o);
+          if (results.length >= limit) return results;
+        }
       }
     }
     return results;
@@ -4430,9 +4560,14 @@ export class Marketplace {
   }
 
   // §39.4 — Lazy expiry sweep (once per minute)
+  // _lastPurge is kept in memory after the first read so the sweep
+  // gate doesn't cost a storage get on every marketplace request;
+  // storage still holds the canonical value across DO restarts.
   async _lazySweep() {
-    const lp = await this.state.storage.get('_lastPurge') || 0;
-    if (Date.now() - lp < this.SWEEP_INTERVAL) return;
+    if (this._lastPurge === undefined) {
+      this._lastPurge = (await this.state.storage.get('_lastPurge')) || 0;
+    }
+    if (Date.now() - this._lastPurge < this.SWEEP_INTERVAL) return;
     const now = Date.now();
     const toDelete = [];
     for (const [, bucket] of this.index) {
@@ -4440,11 +4575,13 @@ export class Marketplace {
         if (o.expires <= now) toDelete.push(o);
       }
     }
-    for (const o of toDelete) {
-      this._removeFromIndex(o);
-      await this.state.storage.delete('order:' + o.id);
+    // Batched delete — DO storage takes up to 128 keys per call.
+    for (const o of toDelete) this._removeFromIndex(o);
+    for (let i = 0; i < toDelete.length; i += 128) {
+      await this.state.storage.delete(toDelete.slice(i, i + 128).map((o) => 'order:' + o.id));
     }
-    await this.state.storage.put('_lastPurge', Date.now());
+    this._lastPurge = Date.now();
+    await this.state.storage.put('_lastPurge', this._lastPurge);
   }
 }
 
@@ -4454,7 +4591,28 @@ export class Marketplace {
 // ═══════════════════════════════════════
 
 export class Leaderboard {
-  constructor(state, env) { this.state = state; this.env = env; }
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    // In-memory player table, lazy-loaded from storage on first read
+    // after a DO wake.  getTop used to storage.list + JSON.parse every
+    // player row on every request; the table only changes through
+    // updatePlayer (singleton DO), which keeps this map in sync, so
+    // once built it never goes stale.
+    this.players = null; // Map<playerId, row>
+  }
+
+  async _ensurePlayers() {
+    if (this.players) return;
+    this.players = new Map();
+    const entries = await this.state.storage.list({ prefix: 'player:' });
+    for (const [key, raw] of entries) {
+      try {
+        const p = JSON.parse(raw);
+        this.players.set(p.id || key.slice('player:'.length), p);
+      } catch {}
+    }
+  }
 
   async fetch(request) {
     const url = new URL(request.url);
@@ -4484,18 +4642,20 @@ export class Leaderboard {
   async updatePlayer(data) {
     const { playerId, name, color, level, rpgData, ts } = data;
     if (!playerId) return;
-    await this.state.storage.put('player:' + playerId, JSON.stringify({
+    const row = {
       id: playerId, name: name || 'Anon', color: color || '#5b52ff', level: level || 1,
       lifeTotal: rpgData?.lifeTotal || 0, ap: rpgData?.ap || 0, kills: rpgData?.kills || 0,
       dungeons: rpgData?.dungeons || 0, goldEarned: rpgData?.goldEarned || 0, playtime: rpgData?.playtime || 0,
       clanTag: rpgData?.clanTag || null, lastSeen: ts || Date.now(),
-    }));
+    };
+    await this.state.storage.put('player:' + playerId, JSON.stringify(row));
+    if (this.players) this.players.set(playerId, row);
   }
 
   async getTop(category, limit) {
-    const entries = await this.state.storage.list({ prefix: 'player:' });
+    await this._ensurePlayers();
     const players = []; const now = Date.now(); const STALE = 7 * 86400000;
-    for (const [, raw] of entries) { try { const p = JSON.parse(raw); if (now - (p.lastSeen || 0) < STALE) players.push(p); } catch {} }
+    for (const p of this.players.values()) { if (now - (p.lastSeen || 0) < STALE) players.push(p); }
     const key = { level:'level', lifeskills:'lifeTotal', ap:'ap', kills:'kills', dungeons:'dungeons', gold:'goldEarned', playtime:'playtime' }[category] || 'level';
     players.sort((a, b) => (b[key] || 0) - (a[key] || 0));
     return players.slice(0, limit);
