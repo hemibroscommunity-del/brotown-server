@@ -76,6 +76,11 @@ export class GameRoom {
     this.state = state;
     this.env = env;
     this.sessions = new Map();
+    // Reverse index: playerId -> WebSocket.  Kept in sync at join /
+    // close so _wsBySessionId / _sessionById are O(1) instead of
+    // scanning every session (they're called per-tick from the
+    // player_state flush and per-recipient on every kill).
+    this.wsBySession = new Map();
     this.playerState = {};
     this.dirtyPlayers = new Set();
     this.eventBuffer = [];
@@ -95,6 +100,14 @@ export class GameRoom {
     // still emit immediately since they're rare and want snappy
     // response.
     this.pendingPlayerStateFlush = new Set();
+
+    // Write-behind RPG persistence.  _saveRpg used to storage.put the
+    // full ~40-field blob immediately at every call site (every monster
+    // attack, every kill recipient, every pickup...).  Mutators now just
+    // mark the player dirty here and _flushRpgSaves() issues one batched
+    // put per tick.  webSocketClose flushes the leaving player directly
+    // so nothing is lost on disconnect.
+    this.pendingRpgSave = new Set();
 
     // §16.12 — PvP Lag Compensation
     this.stateHistory = {};
@@ -346,18 +359,25 @@ export class GameRoom {
   _tickMonsters() {
     const now = Date.now();
     const activeZones = this._activeZones();
+    if (activeZones.size === 0) return;
+
+    // Bucket players by zone in one pass.  This used to run per zone
+    // (O(zones × players)) and spread-copy each player's entire state
+    // object 45 times a second; the AI below only reads id / x / y /
+    // blocking, so snapshot just those.
+    const playersByZone = new Map();
+    for (const [id, ps] of Object.entries(this.playerState)) {
+      if (ps.dead || ps.disconnected || !activeZones.has(ps.z)) continue;
+      let bucket = playersByZone.get(ps.z);
+      if (!bucket) { bucket = []; playersByZone.set(ps.z, bucket); }
+      bucket.push({ id, x: ps.x, y: ps.y, blocking: ps.blocking });
+    }
 
     for (const zoneId of activeZones) {
       const monsters = this._ensureZoneMonsters(zoneId);
       if (!monsters || monsters.length === 0) continue;
 
-      // Get players in this zone
-      const playersInZone = [];
-      for (const [id, ps] of Object.entries(this.playerState)) {
-        if (ps.z === zoneId && !ps.dead && !ps.disconnected) {
-          playersInZone.push({ id, ...ps });
-        }
-      }
+      const playersInZone = playersByZone.get(zoneId) || [];
 
       let zoneChanged = false;
 
@@ -409,16 +429,18 @@ export class GameRoom {
           }
         }
 
-        // Find nearest player for aggro
+        // Find nearest player for aggro.  Compare squared distances —
+        // the actual distance is only needed (one sqrt) in the
+        // move-toward-player branch below.
         let nearest = null;
-        let nearestDist = Infinity;
+        let nearestDistSq = Infinity;
         for (const p of playersInZone) {
           const dx = p.x - m.x;
           const dy = p.y - m.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < nearestDist) {
+          const distSq = dx * dx + dy * dy;
+          if (distSq < nearestDistSq) {
             nearest = p;
-            nearestDist = dist;
+            nearestDistSq = distSq;
           }
         }
 
@@ -431,13 +453,14 @@ export class GameRoom {
         // a stale value still pick up new tuning on the next tick
         // because they execute the latest deployed bytecode.
         const ATTACK_RANGE = 55;
-        if (nearest && nearestDist < this.MONSTER_AGGRO_RANGE) {
+        const ATTACK_RANGE_SQ = ATTACK_RANGE * ATTACK_RANGE;
+        if (nearest && nearestDistSq < this.MONSTER_AGGRO_RANGE * this.MONSTER_AGGRO_RANGE) {
           m.targetId = nearest.id;
           // Move toward player
-          if (nearestDist > ATTACK_RANGE) {
+          if (nearestDistSq > ATTACK_RANGE_SQ) {
             const dx = nearest.x - m.x;
             const dy = nearest.y - m.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
+            const dist = Math.sqrt(nearestDistSq);
             if (dist > 0) {
               m.x += (dx / dist) * m.spd;
               m.y += (dy / dist) * m.spd;
@@ -446,7 +469,7 @@ export class GameRoom {
           }
 
           // Attack player if in range
-          if (nearestDist <= ATTACK_RANGE && now > m.atkCd) {
+          if (nearestDistSq <= ATTACK_RANGE_SQ && now > m.atkCd) {
             // Don't fire damage events while the player is blocking — the
             // client's monster_attack handler also computes block reduction,
             // but that path was producing inconsistent block resolution
@@ -1641,11 +1664,48 @@ export class GameRoom {
     }
   }
 
-  async _saveRpg(playerId, ps) {
+  // Mark a player's RPG state for persistence.  The actual storage
+  // write happens in _flushRpgSaves() at end-of-tick (batched across
+  // players), or in webSocketClose for a leaving player.  Call sites
+  // that need persistence ordering (the join bootstrap) use
+  // _saveRpgNow instead.
+  _saveRpg(playerId, ps) {
     if (!playerId || !ps) return;
-    this._pruneBuffs(ps);
+    this.pendingRpgSave.add(playerId);
+  }
+
+  async _saveRpgNow(playerId, ps) {
+    if (!playerId || !ps) return;
     try {
-      await this.state.storage.put('rpg:' + playerId, {
+      await this.state.storage.put('rpg:' + playerId, this._buildRpgBlob(ps));
+    } catch (e) {}
+  }
+
+  // One batched storage.put per tick for every player marked dirty by
+  // _saveRpg since the last flush.  Collapses e.g. an 8-recipient kill
+  // (formerly 8 sequential puts of full blobs) into a single multi-key
+  // write.  DO storage caps batched puts at 128 keys; MAX_PLAYERS=50
+  // keeps us under it, but guard anyway by carrying overflow to the
+  // next tick.
+  _flushRpgSaves() {
+    if (this.pendingRpgSave.size === 0) return;
+    const entries = {};
+    let count = 0;
+    for (const id of this.pendingRpgSave) {
+      if (count >= 128) break;
+      this.pendingRpgSave.delete(id);
+      const ps = this.playerState[id];
+      if (!ps) continue;
+      entries['rpg:' + id] = this._buildRpgBlob(ps);
+      count++;
+    }
+    if (count === 0) return;
+    try { Promise.resolve(this.state.storage.put(entries)).catch(() => {}); } catch (e) {}
+  }
+
+  _buildRpgBlob(ps) {
+    this._pruneBuffs(ps);
+    return {
         coins: ps.coins || 0,
         inventory: ps.inventory || {},
         lifeSkills: ps.lifeSkills || {},
@@ -1702,8 +1762,7 @@ export class GameRoom {
         // would otherwise let them claim 'perfect' indefinitely
         // by cycling the WS connection between batches).
         _perfectHistory: Array.isArray(ps._perfectHistory) ? ps._perfectHistory : [],
-      });
-    } catch (e) {}
+    };
   }
 
   // Queue a player_state emit for the next tick flush.  Used by
@@ -2169,17 +2228,12 @@ export class GameRoom {
   }
 
   _sessionById(sessionId) {
-    for (const [, s] of this.sessions) {
-      if (s.id === sessionId) return s;
-    }
-    return null;
+    const ws = this.wsBySession.get(sessionId);
+    return ws ? (this.sessions.get(ws) || null) : null;
   }
 
   _wsBySessionId(sessionId) {
-    for (const [ws, s] of this.sessions) {
-      if (s.id === sessionId) return ws;
-    }
-    return null;
+    return this.wsBySession.get(sessionId) || null;
   }
 
   _despawnLoot(zone, lootId) {
@@ -2537,6 +2591,9 @@ export class GameRoom {
     switch (msg.type) {
       case 'join':
         session.id = msg.id;
+        // Newest socket wins the reverse index — on duplicate login the
+        // fresh connection is the one that should receive private sends.
+        this.wsBySession.set(msg.id, ws);
         session.name = msg.name || 'Anon';
         session.data = msg.data || {};
         this.playerState[msg.id] = {
@@ -2544,7 +2601,7 @@ export class GameRoom {
           dodging: false, blocking: false, dead: false, disconnected: false,
           ...msg.data
         };
-        this.stateHistory[msg.id] = [];
+        this.stateHistory[msg.id] = this._newHistoryRing();
         /* Load (or bootstrap) the player's server-authoritative
            coins + inventory.  Stored entry wins; if there's no
            record yet, fall back to the values the client sent in
@@ -2682,7 +2739,7 @@ export class GameRoom {
             this.playerState[msg.id].achievementPoints = Math.max(0, Math.min(99999,
               (msg.data && typeof msg.data.rpgAchievementPoints === 'number') ? Math.floor(msg.data.rpgAchievementPoints) : 0));
             this.playerState[msg.id]._perfectHistory = [];
-            await this._saveRpg(msg.id, this.playerState[msg.id]);
+            await this._saveRpgNow(msg.id, this.playerState[msg.id]);
           }
           // Session-only equipment-derived values.  Always read from join
           // — recomputed client-side on every recalcDerived.
@@ -3092,12 +3149,16 @@ export class GameRoom {
       if (targetPs.z !== attackerPs.z) continue; // different zone
       if (targetPs.dead || targetPs.disconnected) continue;
 
-      // §16.12 — Look up target's historical state
+      // §16.12 — Look up target's historical state in the ring.
+      // head-1 is the most recent snapshot; rewind clamps to the
+      // oldest retained entry (same semantics as the old array index
+      // clamp to 0).
       const history = this.stateHistory[targetId];
       let checkState = targetPs; // fallback: current state
-      if (history && history.length > 0) {
-        const idx = Math.max(0, history.length - 1 - rewindTicks);
-        checkState = history[idx] || targetPs;
+      if (history && history.len > 0) {
+        const back = Math.min(rewindTicks, history.len - 1);
+        const N = this.LAGCOMP_BUFFER_TICKS;
+        checkState = history.buf[(history.head - 1 - back + N * 2) % N] || targetPs;
       }
 
       // Range check against historical position
@@ -3162,6 +3223,18 @@ export class GameRoom {
   async webSocketClose(ws) {
     const session = this.sessions.get(ws);
     if (session?.id) {
+      // Only drop the reverse-index entry if it still points at this
+      // socket — a reconnect's join may have already claimed the id,
+      // and the stale socket's close must not orphan the live one.
+      if (this.wsBySession.get(session.id) === ws) {
+        this.wsBySession.delete(session.id);
+      }
+      // Persist any write-behind state before it's deleted below;
+      // mutations only mark-dirty now, so this is the last chance.
+      if (this.pendingRpgSave.has(session.id)) {
+        this.pendingRpgSave.delete(session.id);
+        await this._saveRpgNow(session.id, this.playerState[session.id]);
+      }
       if (this.playerState[session.id]) this.playerState[session.id].disconnected = true;
       delete this.playerState[session.id];
       delete this.stateHistory[session.id];
@@ -3175,24 +3248,33 @@ export class GameRoom {
 
   async webSocketError(ws) { this.webSocketClose(ws); }
 
+  // Fixed-size ring for §16.12 lag-comp snapshots.  buf[head] is the
+  // next write slot; the most recent snapshot lives at head-1 (mod N).
+  _newHistoryRing() {
+    return { buf: new Array(this.LAGCOMP_BUFFER_TICKS), head: 0, len: 0 };
+  }
+
   startTickLoop() {
     let pingCounter = 0;
     let regenCounter = 0;
 
     this.tickInterval = setInterval(() => {
-      // §16.12 — Snapshot player states to history buffer
+      // §16.12 — Snapshot player states to history ring buffer.
+      // Fixed-size ring (LAGCOMP_BUFFER_TICKS slots) overwritten in
+      // place; replaces the old push + shift array which moved every
+      // element once the buffer filled.
       for (const [id, ps] of Object.entries(this.playerState)) {
-        if (!this.stateHistory[id]) this.stateHistory[id] = [];
-        this.stateHistory[id].push({
+        let h = this.stateHistory[id];
+        if (!h) h = this.stateHistory[id] = this._newHistoryRing();
+        h.buf[h.head] = {
           x: ps.x, y: ps.y, d: ps.d, z: ps.z,
           dodging: ps.dodging || false,
           blocking: ps.blocking || false,
           dead: ps.dead || false,
           tick: this.tickSeq,
-        });
-        if (this.stateHistory[id].length > this.LAGCOMP_BUFFER_TICKS) {
-          this.stateHistory[id].shift();
-        }
+        };
+        h.head = (h.head + 1) % this.LAGCOMP_BUFFER_TICKS;
+        if (h.len < this.LAGCOMP_BUFFER_TICKS) h.len++;
       }
 
       // Monster AI tick
@@ -3222,6 +3304,10 @@ export class GameRoom {
       // instead of emitting per-mutation, so multiple per-tick
       // updates to the same player collapse to one wire emit.
       this._flushPendingPlayerStates();
+
+      // Write-behind RPG persistence — one batched storage.put for
+      // every player _saveRpg-marked dirty this tick.
+      this._flushRpgSaves();
 
       // Periodic ping for RTT estimation + idle-session eviction (every ~3s at 30Hz)
       pingCounter++;
