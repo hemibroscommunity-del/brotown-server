@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Syntax check
+        run: |
+          node --check src/index.js
+          node --check scripts/smoke-test.mjs
+          node --check scripts/load-test.mjs
+
+      - name: Start local server
+        run: npx wrangler dev --port 8787 --local > wrangler.log 2>&1 &
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 60); do
+            curl -s -m 2 http://127.0.0.1:8787/health > /dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "server never came up"; cat wrangler.log; exit 1
+
+      - name: Protocol smoke test
+        run: npm run smoke
+
+      - name: Load sanity (10 clients, 8s)
+        run: CLIENTS=10 DURATION=8 npm run loadtest
+
+      - name: Server log on failure
+        if: failure()
+        run: cat wrangler.log
